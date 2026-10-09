@@ -1,0 +1,30 @@
+[project]
+name = "tg-chat-client"
+version = "0.1.0"
+description = "Manual multi-account Telegram desktop chat client"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "PySide6>=6.8,<7",
+  "telethon>=1.36,<2",
+  "python-socks[asyncio]>=2.4,<3",
+  "tzdata>=2024.1",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "pytest-qt>=4.4,<5", "ruff>=0.9,<1", "pyinstaller>=6.11,<7"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+qt_api = "pyside6"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

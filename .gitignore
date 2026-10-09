@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.session
+*.session-journal
+*.sqlite*
+*.log
+.env*
+data/
+*.spec.bak
