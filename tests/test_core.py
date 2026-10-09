@@ -1,4 +1,3 @@
-import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -100,10 +99,12 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.draft("b", -1)["text"], "另一个账号的草稿")
 
     def test_future_database_version_is_not_overwritten(self):
-        with sqlite3.connect(self.store.path) as db:
+        with self.store.connect() as db:
             db.execute("PRAGMA user_version=2")
         with self.assertRaises(RuntimeError):
             Store(self.root)
+        with self.store.connect() as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
 
 
 class ConfigurationTests(unittest.TestCase):
