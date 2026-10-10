@@ -23,7 +23,7 @@ rtk uv run ruff format --check .
 
 真实模式可随时再次点击“连接设置”，修改代理端口等参数并保存，保存后重新连接全部账号；取消不改变配置。发送、登录或账号操作未完成时会明确提示先完成操作。模拟模式不使用连接设置，需退出后不带 `--mock` 启动真实模式。
 
-界面操作异常时会弹窗提示错误类型，脱敏错误位置保存在 `%LOCALAPPDATA%/TGChatClient/real/logs/client.log`（模拟模式为 `mock` 目录）。排查时提供按钮名称、错误类型和日志中的代码位置即可，无需提供 API Hash 或会话文件。
+启动、连接设置按钮按下和窗口打开/关闭会写入本地操作日志。界面操作异常时会弹窗提示错误类型，脱敏错误位置保存在 `%LOCALAPPDATA%/TGChatClient/real/logs/client.log`（模拟模式为 `mock` 目录）。排查时提供按钮名称、错误类型和日志中的代码位置即可，无需提供 API Hash 或会话文件。
 
 源码位于 `tg_chat_client/`，测试位于 `tests/`，打包配置与说明位于 `packaging/`。默认 Windows 私有数据路径为 `%LOCALAPPDATA%/TGChatClient/real`。开发可用 `--data-dir <目录>` 指定数据位置，仍分隔模拟/真实模式。
 

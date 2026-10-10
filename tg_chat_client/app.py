@@ -74,7 +74,9 @@ def main(argv=None):
             root / "logs" / "client.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"
         )
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
-        logging.basicConfig(level=logging.WARNING, handlers=[handler])
+        logging.basicConfig(level=logging.WARNING, handlers=[handler], force=True)
+        logging.getLogger("tg_chat_client").setLevel(logging.INFO)
+        logging.getLogger(__name__).info("Application started: mock=%s", args.mock)
         # Third-party exceptions can contain private arguments; collect only our sanitized events.
         logging.getLogger("telethon").disabled = True
         logging.getLogger("telethon").addHandler(logging.NullHandler())

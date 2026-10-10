@@ -1,3 +1,4 @@
+import logging
 import re
 import time
 from dataclasses import replace
@@ -31,7 +32,10 @@ from PySide6.QtWidgets import (
 )
 
 from .models import ProxyConfig, SendRequest
+from .native_ime import cancel_windows_composition
 from .store import validate_phrase_alias
+
+logger = logging.getLogger(__name__)
 
 
 class Composer(QTextEdit):
@@ -41,6 +45,9 @@ class Composer(QTextEdit):
         super().__init__()
         self.composing = False
         self.resetting_input_method = False
+        self.ime_reset_timer = QTimer(self)
+        self.ime_reset_timer.setSingleShot(True)
+        self.ime_reset_timer.timeout.connect(self.finish_ime_reset)
         self.phrase_prefix = ";"
         self.phrase_aliases = {}
         self.setPlaceholderText("输入消息；Enter 发送，Shift+Enter 换行")
@@ -85,18 +92,15 @@ class Composer(QTextEdit):
         if re.match(r"[A-Za-z0-9_]", after.selectedText()):
             return False
         if preedit:
-            # Clear the native candidate session before inserting the matched trigger.
-            # Ignore synchronous reset events so they cannot commit a candidate twice.
+            # Wait until the platform finishes delivering this composition event before
+            # cancelling it. Resetting inside that event can leave native candidates alive.
             self.resetting_input_method = True
-            try:
-                QApplication.inputMethod().reset()
-            finally:
-                self.resetting_input_method = False
             commit = QInputMethodEvent("", [])
             commit.setCommitString(preedit)
             super().inputMethodEvent(commit)
             self.composing = False
             cursor = self.textCursor()
+            self.ime_reset_timer.start(0)
         width = len(match[0].encode("utf-16-le")) // 2
         cursor.beginEditBlock()
         cursor.setPosition(cursor.position() - width, QTextCursor.MoveMode.KeepAnchor)
@@ -104,6 +108,16 @@ class Composer(QTextEdit):
         cursor.endEditBlock()
         self.setTextCursor(cursor)
         return True
+
+    def finish_ime_reset(self):
+        try:
+            if self.hasFocus():
+                QApplication.inputMethod().reset()
+                cancel_windows_composition(int(self.window().winId()))
+            super().inputMethodEvent(QInputMethodEvent("", []))
+        finally:
+            self.resetting_input_method = False
+            self.composing = False
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -423,6 +437,7 @@ class MainWindow(QMainWindow):
         self.history_requests = {}
         self.preview_requested = set()
         self.login_dialog = None
+        self.settings_dialog = None
         self.reply_id = None
         self.reply_text = ""
         self.loading_draft = False
@@ -445,7 +460,7 @@ class MainWindow(QMainWindow):
         QApplication.instance().installEventFilter(self.shortcut_filter)
         QTimer.singleShot(0, lambda: self.bridge.submit("start"))
         if not mock and not store.export_settings():
-            QTimer.singleShot(100, self.settings)
+            QTimer.singleShot(100, self.open_connection_settings)
 
     @property
     def target(self):
@@ -456,8 +471,11 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         outer = QVBoxLayout(central)
         toolbar = QHBoxLayout()
+        self.settings_button = QPushButton("连接设置")
+        self.settings_button.pressed.connect(lambda: logger.info("Connection settings pressed"))
+        self.settings_button.clicked.connect(lambda: self.open_connection_settings())
+        toolbar.addWidget(self.settings_button)
         for text, callback in [
-            ("连接设置", self.settings),
             ("添加 / 重新登录", self.open_login),
             ("重新连接", self.reconnect),
             ("管理短句", self.manage_phrases),
@@ -554,7 +572,12 @@ class MainWindow(QMainWindow):
         splitter.setSizes([240, 650, 250])
         self.refresh_counts()
 
-    def settings(self):
+    def open_connection_settings(self):
+        logger.info("Connection settings requested")
+        if self.settings_dialog and self.settings_dialog.isVisible():
+            self.settings_dialog.raise_()
+            self.settings_dialog.activateWindow()
+            return
         reason = ""
         if self.account_actions:
             reason = "请等待账号操作完成后再修改连接设置。"
@@ -565,11 +588,32 @@ class MainWindow(QMainWindow):
         elif self.login_dialog and self.login_dialog.isVisible():
             reason = "请完成或取消登录，关闭登录窗口后再修改连接设置。"
         if reason:
+            logger.info("Connection settings blocked")
             self.notice.setText(reason)
             QMessageBox.information(self, "暂时无法修改连接设置", reason)
             return
-        if SettingsDialog(self.store, self).exec() == QDialog.DialogCode.Accepted:
+        self.notice.setText("正在打开连接设置…")
+        dialog = SettingsDialog(self.store, self)
+        self.settings_dialog = dialog
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.finished.connect(self.connection_settings_finished)
+        dialog.adjustSize()
+        dialog.move(self.frameGeometry().center() - dialog.rect().center())
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        logger.info("Connection settings shown")
+
+    def connection_settings_finished(self, result):
+        dialog = self.settings_dialog
+        self.settings_dialog = None
+        if dialog:
+            dialog.deleteLater()
+        logger.info("Connection settings finished: %s", result)
+        if result == QDialog.DialogCode.Accepted:
             self.reconnect()
+        else:
+            self.notice.setText("已取消修改连接设置。")
 
     def reconnect(self):
         if (
@@ -590,7 +634,7 @@ class MainWindow(QMainWindow):
             self.notice.setText("模拟模式提供五个示例账号，不进行真实登录。")
             return
         if not self.store.export_settings():
-            self.settings()
+            self.open_connection_settings()
             return
         if self.pending_sends:
             self.notice.setText("请等待发送结束后再登录。")

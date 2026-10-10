@@ -37,7 +37,6 @@ def test_first_run_settings_can_reopen_after_saving_without_accounts(qtbot, tmp_
     window = MainWindow(store, bridge)
     qtbot.addWidget(window)
     window.show()
-    opened = []
 
     def save_first_settings():
         dialog = QApplication.activeModalWidget()
@@ -51,21 +50,17 @@ def test_first_run_settings_can_reopen_after_saving_without_accounts(qtbot, tmp_
     qtbot.waitUntil(lambda: "reconnect" in bridge.calls)
     assert window.accounts.count() == 0
 
-    def reopen():
-        dialog = QApplication.activeModalWidget()
-        assert isinstance(dialog, SettingsDialog)
-        opened.append(dialog.port.value())
-        dialog.reject()
-
-    QTimer.singleShot(0, reopen)
     button = next(b for b in window.findChildren(QPushButton) if b.text() == "连接设置")
     qtbot.mouseClick(button, Qt.MouseButton.LeftButton)
-    assert opened == [7892]
+    dialog = window.settings_dialog
+    assert isinstance(dialog, SettingsDialog)
+    assert dialog.isVisible()
+    assert dialog.port.value() == 7892
+    dialog.reject()
     window.close()
 
 
 def test_connection_settings_button_reopens_and_updates_proxy(window, qtbot, monkeypatch):
-    from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QPushButton
 
     from tg_chat_client.models import ProxyConfig
@@ -76,33 +71,46 @@ def test_connection_settings_button_reopens_and_updates_proxy(window, qtbot, mon
     calls = []
     monkeypatch.setattr(window.bridge, "submit", lambda op, **kw: calls.append(op))
     button = next(b for b in window.findChildren(QPushButton) if b.text() == "连接设置")
-    opened = []
-
-    def update_port():
-        dialog = QApplication.activeModalWidget()
-        assert isinstance(dialog, SettingsDialog)
-        opened.append(dialog.port.value())
-        dialog.port.setValue(7893)
-        dialog.save()
-
-    QTimer.singleShot(0, update_port)
     qtbot.mouseClick(button, Qt.MouseButton.LeftButton)
-    assert opened == [7892]
+    dialog = window.settings_dialog
+    assert isinstance(dialog, SettingsDialog)
+    assert dialog.isVisible()
+    assert dialog.port.value() == 7892
+    dialog.port.setValue(7893)
+    dialog.save()
     assert window.store.export_settings()["proxy"]["port"] == 7893
     assert calls == ["reconnect"]
 
-    def cancel():
-        dialog = QApplication.activeModalWidget()
-        assert isinstance(dialog, SettingsDialog)
-        opened.append(dialog.port.value())
-        dialog.port.setValue(7894)
+    qtbot.mouseClick(button, Qt.MouseButton.LeftButton)
+    dialog = window.settings_dialog
+    assert dialog.isVisible()
+    assert dialog.port.value() == 7893
+    dialog.port.setValue(7894)
+    dialog.reject()
+    assert window.store.export_settings()["proxy"]["port"] == 7893
+    assert calls == ["reconnect"]
+
+
+def test_settings_dialog_is_owned_visible_and_clicks_are_logged(window, qtbot, caplog):
+    import logging
+
+    from tg_chat_client.models import ProxyConfig
+
+    window.mock = False
+    window.store.save_connection(123, "test-private-hash", ProxyConfig(port=7892))
+    with caplog.at_level(logging.INFO, logger="tg_chat_client.ui"):
+        qtbot.mouseClick(window.settings_button, Qt.MouseButton.LeftButton)
+        dialog = window.settings_dialog
+        assert dialog.isVisible()
+        assert window.geometry().intersects(dialog.geometry())
+        window.open_connection_settings()
+        assert window.settings_dialog is dialog
         dialog.reject()
-
-    QTimer.singleShot(0, cancel)
-    qtbot.mouseClick(button, Qt.MouseButton.LeftButton)
-    assert opened == [7892, 7893]
-    assert window.store.export_settings()["proxy"]["port"] == 7893
-    assert calls == ["reconnect"]
+    assert "Connection settings pressed" in caplog.text
+    assert "Connection settings requested" in caplog.text
+    assert "Connection settings shown" in caplog.text
+    assert "Connection settings finished" in caplog.text
+    assert "test-private-hash" not in caplog.text
 
 
 @pytest.mark.parametrize("blocked", ["mock", "send", "account", "login"])
@@ -631,6 +639,9 @@ def test_unmatched_ime_candidates_continue_normally(qtbot, draft, preedit):
 def test_ime_reset_does_not_commit_duplicate_candidate(qtbot, monkeypatch):
     composer = Composer()
     qtbot.addWidget(composer)
+    composer.show()
+    composer.setFocus()
+    qtbot.waitUntil(composer.hasFocus)
     composer.phrase_aliases = {"nh": "你好"}
     composer.setPlainText(";")
     composer.moveCursor(QTextCursor.MoveOperation.End)
@@ -645,9 +656,41 @@ def test_ime_reset_does_not_commit_duplicate_candidate(qtbot, monkeypatch):
 
     monkeypatch.setattr(QApplication, "inputMethod", lambda: InputMethod())
     composer.inputMethodEvent(QInputMethodEvent("nh", []))
+    assert resets == []
+    qtbot.waitUntil(lambda: not composer.resetting_input_method)
     assert resets == [True]
     assert composer.toPlainText() == "你好"
     assert not composer.composing
+
+
+def test_late_candidate_commit_is_discarded_before_deferred_cancel(qtbot, monkeypatch):
+    from tg_chat_client import ui
+
+    composer = Composer()
+    qtbot.addWidget(composer)
+    composer.show()
+    composer.setFocus()
+    qtbot.waitUntil(composer.hasFocus)
+    cancelled = []
+    monkeypatch.setattr(ui, "cancel_windows_composition", lambda hwnd: cancelled.append(hwnd))
+    composer.phrase_aliases = {"nh": "短句正文"}
+    composer.setPlainText(";")
+    composer.moveCursor(QTextCursor.MoveOperation.End)
+    composer.inputMethodEvent(QInputMethodEvent("nh", []))
+    # A native input method can deliver a commit after the expansion callback returns.
+    stale_commit = QInputMethodEvent("", [])
+    stale_commit.setCommitString("你好")
+    composer.inputMethodEvent(stale_commit)
+    assert composer.toPlainText() == "短句正文"
+    qtbot.waitUntil(lambda: not composer.resetting_input_method)
+    assert len(cancelled) == 1
+    qtbot.keyClick(composer, Qt.Key.Key_Space)
+    assert composer.toPlainText() == "短句正文 "
+    composer.inputMethodEvent(QInputMethodEvent("zhongwen", []))
+    fresh_commit = QInputMethodEvent("", [])
+    fresh_commit.setCommitString("中文")
+    composer.inputMethodEvent(fresh_commit)
+    assert composer.toPlainText() == "短句正文 中文"
 
 
 def test_ime_prefix_commit_and_candidate_can_arrive_together(window, qtbot):
@@ -659,6 +702,7 @@ def test_ime_prefix_commit_and_candidate_can_arrive_together(window, qtbot):
     window.input.inputMethodEvent(event)
     assert window.input.toPlainText() == ";dj"
     assert not window.pending_sends
+    qtbot.waitUntil(lambda: not window.input.resetting_input_method)
     window.input.inputMethodEvent(QInputMethodEvent("zhongwen", []))
     event = QInputMethodEvent("", [])
     event.setCommitString("中文")
