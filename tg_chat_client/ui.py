@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QTextEdit,
@@ -340,7 +341,8 @@ class MainWindow(QMainWindow):
         self.notice.setWordWrap(True)
         self.notice.setTextFormat(Qt.TextFormat.PlainText)
         outer.addWidget(self.notice)
-        splitter = QSplitter()
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
         outer.addWidget(splitter, 1)
         left = QWidget()
         left_layout = QVBoxLayout(left)
@@ -402,11 +404,19 @@ class MainWindow(QMainWindow):
         self.phrase_layout.setContentsMargins(0, 0, 0, 0)
         phrase_scroll = QScrollArea()
         phrase_scroll.setWidgetResizable(True)
-        phrase_scroll.setMaximumHeight(210)
         phrase_scroll.setWidget(self.phrase_widget)
-        right_layout.addWidget(phrase_scroll)
         splitter.addWidget(right)
-        splitter.setSizes([270, 850])
+        phrase_panel = QWidget()
+        phrase_panel.setMinimumWidth(180)
+        phrase_panel_layout = QVBoxLayout(phrase_panel)
+        phrase_panel_layout.addWidget(QLabel("快捷短句 · Ctrl+1～9"))
+        phrase_hint = QLabel("点击或按快捷键插入，Enter 发送")
+        phrase_hint.setWordWrap(True)
+        phrase_panel_layout.addWidget(phrase_hint)
+        phrase_panel_layout.addWidget(phrase_scroll, 1)
+        splitter.addWidget(phrase_panel)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([240, 650, 250])
         self.refresh_counts()
 
     def settings(self):
@@ -460,16 +470,25 @@ class MainWindow(QMainWindow):
         if not self.phrases:
             self.phrase_layout.addWidget(QLabel("尚无短句，点击“管理短句”添加。"))
         for index, phrase in enumerate(self.phrases):
-            shortcut = f"Alt+{index + 1} · " if index < 9 else ""
+            shortcut = f"Ctrl+{index + 1} · " if index < 9 else ""
             button = QPushButton(
                 shortcut + phrase["text"].replace("\n", " ").replace("&", "&&")[:70]
             )
+            button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            button.setStyleSheet("text-align: left; padding-left: 6px;")
             button.setToolTip(phrase["text"])
             button.clicked.connect(
-                lambda checked=False, text=phrase["text"]: self.send_text(text, "phrase")
+                lambda checked=False, text=phrase["text"]: self.insert_phrase(text)
             )
             self.phrase_layout.addWidget(button)
+        self.phrase_layout.addStretch()
         self.refresh_counts()
+
+    def insert_phrase(self, text):
+        if not self.account_id or self.chat_id is None or self.input.composing:
+            return
+        self.input.insertPlainText(text)
+        self.input.setFocus()
 
     def refresh_accounts(self):
         selected = self.account_id
@@ -762,8 +781,9 @@ class MainWindow(QMainWindow):
             item = self.accounts.item(i)
             aid = item.data(Qt.ItemDataRole.UserRole)
             account = accounts[aid]
+            shortcut = f"Alt+{i + 1} · " if i < 9 else ""
             item.setText(
-                f"{i + 1}. {account['label']} · {self.store.count(aid)} 条\n"
+                f"{shortcut}{account['label']} · {self.store.count(aid)} 条\n"
                 f"{self.statuses.get(aid, '未连接')}"
             )
         valid = bool(self.account_id and self.chat_id is not None)
@@ -773,7 +793,7 @@ class MainWindow(QMainWindow):
         wait = max(0, int(deadline - time.monotonic()) + 1)
         busy = self.target in self.pending_sends
         self.send_button.setEnabled(valid and not busy and not wait)
-        self.phrase_widget.setEnabled(valid and not busy and not wait)
+        self.phrase_widget.setEnabled(valid)
         self.input.setEnabled(valid)
         self.older.setEnabled(
             valid
@@ -913,17 +933,22 @@ class ShortcutFilter(QWidget):
     def eventFilter(self, watched, event):
         if isinstance(event, QKeyEvent) and event.type() == event.Type.KeyPress:
             window = self.window
-            if QApplication.activeWindow() is not window or window.input.composing:
+            if QApplication.activeWindow() is not window:
                 return False
             index = event.key() - Qt.Key.Key_1
             modifiers = event.modifiers()
             if 0 <= index < 9:
-                if modifiers == Qt.KeyboardModifier.ControlModifier and index < 5:
+                if window.input.composing and modifiers in (
+                    Qt.KeyboardModifier.AltModifier,
+                    Qt.KeyboardModifier.ControlModifier,
+                ):
+                    return True
+                if modifiers == Qt.KeyboardModifier.AltModifier:
                     if not event.isAutoRepeat() and index < window.accounts.count():
                         window.accounts.setCurrentRow(index)
                     return True
-                if modifiers == Qt.KeyboardModifier.AltModifier:
+                if modifiers == Qt.KeyboardModifier.ControlModifier:
                     if not event.isAutoRepeat() and index < len(window.phrases):
-                        window.send_text(window.phrases[index]["text"], "phrase")
+                        window.insert_phrase(window.phrases[index]["text"])
                     return True
         return False
