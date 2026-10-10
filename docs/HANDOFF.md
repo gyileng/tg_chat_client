@@ -1,5 +1,20 @@
 # 会话交接
 
+## 验证码请求报错修复（2026-10-10）
+
+用户报告配置本地混合代理端口后，获取验证码显示 `Request was unsuccessful 1 time(s)`。源码将 Telethon 的 `request_retries` 设为 0；Telegram 返回数据中心迁移要求时，Telethon 切换 DC 后无法继续请求，并用通用 ValueError 隐藏原始原因。该缺陷已离线复现，但未确认用户此次失败的底层原因，亦未连接用户代理或真实账号。
+
+保持消息请求不自动重试，新增 `raise_last_call_error=True` 暴露真实 RPC 错误。验证码请求仅在 Telethon 已处理 DC 迁移后继续，最多请求三次；网络异常、限流不自动重试，失败清理待登录状态。真实 Telethon 请求循环回归覆盖迁移后成功，另覆盖网络/限流不重试和迁移次数上限。
+
+本机 Python 3.14.4、Telethon 1.44.0 下 35 项核心与服务测试通过，补丁空白检查通过。此环境缺少 python-socks，测试使用模拟依赖与网络响应，不建立连接；不代表目标 Python 3.12、真实代理或 Windows 登录验收。尚未构建新版 Windows 包。
+
+```bash
+rtk proxy env PYTHONPYCACHEPREFIX=/private/tmp/tg-chat-pycache /Users/baiweispace/Documents/self/tg_bot/.venv/bin/python -m unittest tests.test_core tests.test_service -q
+rtk proxy git diff --check
+```
+
+下一步构建新版 Windows 包；若代理与应用在同一台电脑，确认代理混合端口后使用 SOCKS5、127.0.0.1 和用户配置的端口验证。失败时依据新版具体错误排查，不把通用错误直接认定为代理故障。
+
 ## 短句缩写展开（2026-10-10，当前交互）
 
 用户确认取消短句 `Ctrl+1…9`，保留点击插入与 `Alt+1…9` 切账号。管理短句新增共用前缀与每条可选缩写：默认前缀 `;`，输入 `;nh` 后按普通空格精确展开，消耗确认空格，再按 Enter 或发送按钮手动发送。缩写使用英文字母、数字和下划线，不区分大小写且不可重复。前缀可改为一个或多个非空白符号；所有账号共用，重启保留。右侧面板显示触发串及正文，点击仍在光标处插入或替换选区。

@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-from telethon.errors import FloodWaitError, SlowModeWaitError
+from telethon.errors import FloodWaitError, PhoneMigrateError, SlowModeWaitError
 
 from tg_chat_client.models import ChatMessage, SendRequest
 from tg_chat_client.service import MockService, ServiceRuntime, TelegramService, prune_cache
@@ -219,6 +219,74 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict("sys.modules", {"python_socks": None}):
             with self.assertRaisesRegex(ValueError, "python-socks"):
                 service.client("a")
+
+    async def test_code_request_continues_after_telethon_switches_dc(self):
+        from telethon.tl.types import auth
+
+        from tg_chat_client.models import ProxyConfig
+
+        self.store.save_connection(123, "test-only-hash", ProxyConfig(port=7892))
+        service = TelegramService(self.store, self.events.append)
+        with patch.dict("sys.modules", {"python_socks": Mock()}):
+            client = service.client("login-test")
+        client.connect = AsyncMock()
+        client.disconnect = AsyncMock()
+        client.is_user_authorized = AsyncMock(return_value=False)
+        client._switch_dc = AsyncMock()
+        responses = [
+            PhoneMigrateError(request=None, capture=5),
+            auth.SentCode(type=auth.SentCodeTypeApp(length=5), phone_code_hash="test-code-hash"),
+        ]
+
+        def send(request, **kwargs):
+            future = asyncio.get_running_loop().create_future()
+            response = responses.pop(0)
+            if isinstance(response, Exception):
+                future.set_exception(response)
+            else:
+                future.set_result(response)
+            return future
+
+        client._sender.send = Mock(side_effect=send)
+        try:
+            with patch.object(service, "client", return_value=client):
+                result = await service.request_code("+123")
+            client._switch_dc.assert_awaited_once_with(5)
+            self.assertEqual(client._sender.send.call_count, 2)
+            self.assertEqual(service.codes[result["account_id"]]["hash"], "test-code-hash")
+            self.assertEqual(self.events[-1]["status"], "等待验证码")
+        finally:
+            client.session.close()
+
+    async def test_code_failure_is_not_retried_and_clears_pending_login(self):
+        for error in (OSError("test network failure"), FloodWaitError(request=None, capture=30)):
+            with self.subTest(error=type(error).__name__):
+                service = TelegramService(self.store, self.events.append)
+                client = Mock()
+                client.connect = AsyncMock()
+                client.disconnect = AsyncMock()
+                client.send_code_request = AsyncMock(side_effect=error)
+                with patch.object(service, "client", return_value=client):
+                    with self.assertRaises(type(error)):
+                        await service.request_code("+123")
+                client.send_code_request.assert_awaited_once()
+                client.disconnect.assert_awaited_once()
+                self.assertFalse(service.codes)
+                self.assertFalse(service.clients)
+                self.assertFalse(self.store.accounts())
+
+    async def test_code_dc_migrations_have_a_finite_limit(self):
+        service = TelegramService(self.store, self.events.append)
+        client = Mock()
+        client.connect = AsyncMock()
+        client.disconnect = AsyncMock()
+        client.send_code_request = AsyncMock(side_effect=PhoneMigrateError(request=None, capture=5))
+        with patch.object(service, "client", return_value=client):
+            with self.assertRaises(PhoneMigrateError):
+                await service.request_code("+123")
+        self.assertEqual(client.send_code_request.await_count, 3)
+        self.assertFalse(service.codes)
+        self.assertFalse(service.clients)
 
     async def test_canceled_send_becomes_unknown_without_retry(self):
         task = asyncio.create_task(self.send(self.request()))

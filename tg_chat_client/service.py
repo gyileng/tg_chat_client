@@ -169,6 +169,7 @@ class TelegramService:
             settings["api_hash"],
             proxy=proxy.telethon(),
             request_retries=0,
+            raise_last_call_error=True,
             connection_retries=2,
             retry_delay=1,
             flood_sleep_threshold=0,
@@ -254,6 +255,8 @@ class TelegramService:
         self.status(aid, "登录已失效：请重新登录")
 
     async def request_code(self, phone):
+        from telethon.errors import NetworkMigrateError, PhoneMigrateError, UserMigrateError
+
         phone = phone.strip()
         if not phone.startswith("+") or not phone[1:].isdigit():
             raise ValueError("手机号请使用 +国家代码号码 格式")
@@ -266,7 +269,15 @@ class TelegramService:
         self.codes[aid] = {"phone": phone}
         try:
             await asyncio.wait_for(client.connect(), 20)
-            code = await client.send_code_request(phone)
+            for attempt in range(3):
+                try:
+                    code = await client.send_code_request(phone)
+                    break
+                except (PhoneMigrateError, NetworkMigrateError, UserMigrateError):
+                    # Telethon has already switched DC. Continue only this rejected
+                    # login request; never retry network failures or message sends.
+                    if attempt == 2:
+                        raise
             self.codes[aid]["hash"] = code.phone_code_hash
             self.store.add_account(aid, account["label"] if account else phone, phone)
             self.status(aid, "等待验证码")
