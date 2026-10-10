@@ -4,7 +4,7 @@ from dataclasses import replace
 from uuid import uuid4
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QKeyEvent, QPixmap, QTextCursor
+from PySide6.QtGui import QColor, QInputMethodEvent, QKeyEvent, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -40,16 +40,32 @@ class Composer(QTextEdit):
     def __init__(self):
         super().__init__()
         self.composing = False
+        self.resetting_input_method = False
         self.phrase_prefix = ";"
         self.phrase_aliases = {}
         self.setPlaceholderText("输入消息；Enter 发送，Shift+Enter 换行")
         self.setMaximumHeight(110)
 
     def inputMethodEvent(self, event):
+        if self.resetting_input_method:
+            event.accept()
+            return
+        selected = self.textCursor().hasSelection()
+        expand = (
+            not event.preeditString()
+            and bool(re.search(r"[A-Za-z0-9_]$", event.commitString()))
+            and not selected
+        )
         self.composing = bool(event.preeditString())
         super().inputMethodEvent(event)
+        preedit = event.preeditString()
+        if not selected and re.fullmatch(r"[A-Za-z0-9_]+(?:[ '][A-Za-z0-9_]+)*", preedit):
+            # Some Pinyin input methods separate syllables with spaces or apostrophes.
+            self.expand_phrase(preedit.replace(" ", "").replace("'", ""))
+        elif expand:
+            self.expand_phrase()
 
-    def expand_phrase(self):
+    def expand_phrase(self, preedit=""):
         cursor = self.textCursor()
         if cursor.hasSelection():
             return False
@@ -58,7 +74,7 @@ class Composer(QTextEdit):
         prefix_pattern = "".join(
             "[;；]" if char in ";；" else re.escape(char) for char in self.phrase_prefix
         )
-        match = re.search(prefix_pattern + r"([A-Za-z0-9_]+)$", before.selectedText())
+        match = re.search(prefix_pattern + r"([A-Za-z0-9_]+)$", before.selectedText() + preedit)
         if not match:
             return False
         text = self.phrase_aliases.get(match[1].lower())
@@ -68,6 +84,19 @@ class Composer(QTextEdit):
         after.movePosition(QTextCursor.MoveOperation.NextCharacter, QTextCursor.MoveMode.KeepAnchor)
         if re.match(r"[A-Za-z0-9_]", after.selectedText()):
             return False
+        if preedit:
+            # Clear the native candidate session before inserting the matched trigger.
+            # Ignore synchronous reset events so they cannot commit a candidate twice.
+            self.resetting_input_method = True
+            try:
+                QApplication.inputMethod().reset()
+            finally:
+                self.resetting_input_method = False
+            commit = QInputMethodEvent("", [])
+            commit.setCommitString(preedit)
+            super().inputMethodEvent(commit)
+            self.composing = False
+            cursor = self.textCursor()
         width = len(match[0].encode("utf-16-le")) // 2
         cursor.beginEditBlock()
         cursor.setPosition(cursor.position() - width, QTextCursor.MoveMode.KeepAnchor)

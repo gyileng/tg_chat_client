@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import sys
+import traceback
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -12,6 +13,22 @@ from .bridge import ServiceBridge
 from .service import prune_cache
 from .store import Store
 from .ui import MainWindow
+
+
+def report_ui_exception(exc_type, exc_value, exc_traceback):
+    # Do not log exception text or frame locals: they may contain credentials or chat content.
+    locations = "\n".join(
+        f"{Path(frame.filename).name}:{frame.lineno} in {frame.name}"
+        for frame in traceback.extract_tb(exc_traceback)
+    )
+    logging.getLogger(__name__).error("UI callback failed: %s\n%s", exc_type.__name__, locations)
+    QMessageBox.critical(
+        QApplication.activeWindow(),
+        "操作失败",
+        f"界面操作发生错误（{exc_type.__name__}）。\n"
+        "请记录刚才点击的按钮，并提供本地 logs/client.log 中的错误位置，方便排查。\n"
+        "日志不记录异常正文、API 参数或聊天内容。",
+    )
 
 
 def data_root(mock=False):
@@ -50,6 +67,7 @@ def main(argv=None):
         QMessageBox.information(None, "程序已运行", "相同数据目录的程序已运行，请使用已有窗口。")
         return 1
     bridge = None
+    previous_exception_hook = sys.excepthook
     try:
         store = Store(root)
         handler = RotatingFileHandler(
@@ -61,6 +79,7 @@ def main(argv=None):
         logging.getLogger("telethon").disabled = True
         logging.getLogger("telethon").addHandler(logging.NullHandler())
         logging.getLogger("telethon").propagate = False
+        sys.excepthook = report_ui_exception
         prune_cache(root)
         bridge = ServiceBridge(store, args.mock)
         window = MainWindow(store, bridge, args.mock)
@@ -77,6 +96,7 @@ def main(argv=None):
         QMessageBox.critical(None, "无法启动", message)
         return 1
     finally:
+        sys.excepthook = previous_exception_hook
         if bridge:
             bridge.close()
         lock.unlock()

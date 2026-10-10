@@ -13,6 +13,57 @@ from tg_chat_client.store import Store
 from tg_chat_client.ui import Composer, MainWindow
 
 
+def test_first_run_settings_can_reopen_after_saving_without_accounts(qtbot, tmp_path):
+    from PySide6.QtCore import QObject, QTimer, Signal
+    from PySide6.QtWidgets import QPushButton
+
+    from tg_chat_client.ui import SettingsDialog
+
+    class OfflineBridge(QObject):
+        event = Signal(object)
+
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def submit(self, operation, **args):
+            self.calls.append(operation)
+
+        def close(self):
+            pass
+
+    store = Store(tmp_path)
+    bridge = OfflineBridge()
+    window = MainWindow(store, bridge)
+    qtbot.addWidget(window)
+    window.show()
+    opened = []
+
+    def save_first_settings():
+        dialog = QApplication.activeModalWidget()
+        assert isinstance(dialog, SettingsDialog)
+        dialog.api_id.setText("123")
+        dialog.api_hash.setText("test-only-hash")
+        dialog.port.setValue(7892)
+        dialog.save()
+
+    QTimer.singleShot(150, save_first_settings)
+    qtbot.waitUntil(lambda: "reconnect" in bridge.calls)
+    assert window.accounts.count() == 0
+
+    def reopen():
+        dialog = QApplication.activeModalWidget()
+        assert isinstance(dialog, SettingsDialog)
+        opened.append(dialog.port.value())
+        dialog.reject()
+
+    QTimer.singleShot(0, reopen)
+    button = next(b for b in window.findChildren(QPushButton) if b.text() == "连接设置")
+    qtbot.mouseClick(button, Qt.MouseButton.LeftButton)
+    assert opened == [7892]
+    window.close()
+
+
 def test_connection_settings_button_reopens_and_updates_proxy(window, qtbot, monkeypatch):
     from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QPushButton
@@ -515,6 +566,107 @@ def test_expansion_does_not_run_for_ime_selection_or_loading(qtbot):
         QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_H, Qt.KeyboardModifier.NoModifier, "h", True),
     )
     assert composer.toPlainText() == ";nh"
+
+
+@pytest.mark.parametrize("prefix,commit", [(";", "nh"), ("；", "NH"), ("", "；nh")])
+def test_ime_committed_alias_expands_and_preserves_quote(window, qtbot, prefix, commit):
+    window.store.replace_phrases([{"text": "你好", "alias": "nh"}])
+    window.refresh_phrases()
+    window.input.setPlainText(f"😀前{prefix}后")
+    cursor = window.input.textCursor()
+    cursor.setPosition(len(f"😀前{prefix}".encode("utf-16-le")) // 2)
+    window.input.setTextCursor(cursor)
+    window.quote(window.messages.item(0))
+    reply = window.reply_id
+    window.input.inputMethodEvent(QInputMethodEvent("n", []))
+    event = QInputMethodEvent("", [])
+    event.setCommitString(commit)
+    window.input.inputMethodEvent(event)
+    assert window.input.toPlainText() == "😀前你好后"
+    assert window.reply_id == reply
+    assert window.store.draft(*window.target)["text"] == "😀前你好后"
+    assert not window.pending_sends
+    window.input.undo()
+    assert window.input.toPlainText() == f"😀前{prefix}{commit}后"
+
+
+@pytest.mark.parametrize("prefix,preedit", [(";", "nh"), ("；", "NH"), (";+", "n h"), (";", "n'h")])
+def test_ime_candidate_alias_expands_immediately(window, qtbot, prefix, preedit):
+    window.store.replace_phrases([{"text": "你好", "alias": "nh"}], prefix=prefix)
+    window.refresh_phrases()
+    window.input.setPlainText(f"😀前{prefix}后")
+    cursor = window.input.textCursor()
+    cursor.setPosition(len(f"😀前{prefix}".encode("utf-16-le")) // 2)
+    window.input.setTextCursor(cursor)
+    window.quote(window.messages.item(0))
+    reply = window.reply_id
+    window.input.inputMethodEvent(QInputMethodEvent("n", []))
+    assert window.input.composing
+    assert window.input.toPlainText() == f"😀前{prefix}后"
+    window.input.inputMethodEvent(QInputMethodEvent(preedit, []))
+    assert window.input.toPlainText() == "😀前你好后"
+    assert not window.input.composing
+    assert window.reply_id == reply
+    assert window.store.draft(*window.target)["text"] == "😀前你好后"
+    assert not window.pending_sends
+    window.input.inputMethodEvent(QInputMethodEvent("", []))
+    assert window.input.toPlainText() == "😀前你好后"
+    window.input.undo()
+    alias = preedit.replace(" ", "").replace("'", "")
+    assert window.input.toPlainText() == f"😀前{prefix}{alias}后"
+
+
+@pytest.mark.parametrize("draft,preedit", [("", "nh"), (";", "nihao"), (";", "你好"), (";", "nx")])
+def test_unmatched_ime_candidates_continue_normally(qtbot, draft, preedit):
+    composer = Composer()
+    qtbot.addWidget(composer)
+    composer.phrase_aliases = {"nh": "你好"}
+    composer.setPlainText(draft)
+    composer.moveCursor(QTextCursor.MoveOperation.End)
+    composer.inputMethodEvent(QInputMethodEvent(preedit, []))
+    assert composer.toPlainText() == draft
+    assert composer.composing
+
+
+def test_ime_reset_does_not_commit_duplicate_candidate(qtbot, monkeypatch):
+    composer = Composer()
+    qtbot.addWidget(composer)
+    composer.phrase_aliases = {"nh": "你好"}
+    composer.setPlainText(";")
+    composer.moveCursor(QTextCursor.MoveOperation.End)
+    resets = []
+
+    class InputMethod:
+        def reset(self):
+            resets.append(True)
+            event = QInputMethodEvent("", [])
+            event.setCommitString("你好")
+            composer.inputMethodEvent(event)
+
+    monkeypatch.setattr(QApplication, "inputMethod", lambda: InputMethod())
+    composer.inputMethodEvent(QInputMethodEvent("nh", []))
+    assert resets == [True]
+    assert composer.toPlainText() == "你好"
+    assert not composer.composing
+
+
+def test_ime_prefix_commit_and_candidate_can_arrive_together(window, qtbot):
+    window.store.replace_phrases([{"text": ";dj", "alias": "nh"}, {"text": "你好", "alias": "dj"}])
+    window.refresh_phrases()
+    window.input.clear()
+    event = QInputMethodEvent("nh", [])
+    event.setCommitString("；")
+    window.input.inputMethodEvent(event)
+    assert window.input.toPlainText() == ";dj"
+    assert not window.pending_sends
+    window.input.inputMethodEvent(QInputMethodEvent("zhongwen", []))
+    event = QInputMethodEvent("", [])
+    event.setCommitString("中文")
+    window.input.inputMethodEvent(event)
+    assert window.input.toPlainText() == ";dj中文"
+    assert window.store.draft(*window.target)["text"] == ";dj中文"
+    qtbot.keyClick(window.input, Qt.Key.Key_Return)
+    qtbot.waitUntil(lambda: window.store.count(*window.target) == 1 and not window.pending_sends)
 
 
 def test_pasted_alias_and_expanded_content_do_not_expand_recursively(qtbot):
