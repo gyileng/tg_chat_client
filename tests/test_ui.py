@@ -107,10 +107,43 @@ def test_settings_dialog_is_owned_visible_and_clicks_are_logged(window, qtbot, c
         assert window.settings_dialog is dialog
         dialog.reject()
     assert "Connection settings pressed" in caplog.text
+    assert "Settings area mouse press" in caplog.text
     assert "Connection settings requested" in caplog.text
     assert "Connection settings shown" in caplog.text
     assert "Connection settings finished" in caplog.text
     assert "test-private-hash" not in caplog.text
+
+
+def test_settings_button_tab_order_and_keyboard_activation(window, qtbot, monkeypatch):
+    from PySide6.QtWidgets import QPushButton
+
+    from tg_chat_client.models import ProxyConfig
+
+    window.mock = False
+    window.store.save_connection(123, "test-only-hash", ProxyConfig(port=7892))
+    window.activateWindow()
+    window.settings_button.setFocus()
+    qtbot.waitUntil(window.settings_button.hasFocus)
+    assert window.settings_button.isEnabled()
+    assert (
+        QApplication.widgetAt(
+            window.settings_button.mapToGlobal(window.settings_button.rect().center())
+        )
+        is window.settings_button
+    )
+    qtbot.keyClick(window.settings_button, Qt.Key.Key_Tab)
+    next_button = QApplication.focusWidget()
+    assert isinstance(next_button, QPushButton)
+    assert next_button.text() == "添加 / 重新登录"
+    qtbot.keyClick(next_button, Qt.Key.Key_Tab, Qt.KeyboardModifier.ShiftModifier)
+    assert window.settings_button.hasFocus()
+    qtbot.keyClick(window.settings_button, Qt.Key.Key_Space)
+    assert window.settings_dialog.isVisible()
+    window.settings_dialog.reject()
+    window.input.setFocus()
+    qtbot.keyClick(window.input, Qt.Key.Key_Comma, Qt.KeyboardModifier.ControlModifier)
+    assert window.settings_dialog.isVisible()
+    window.settings_dialog.reject()
 
 
 @pytest.mark.parametrize("blocked", ["mock", "send", "account", "login"])
@@ -691,6 +724,61 @@ def test_late_candidate_commit_is_discarded_before_deferred_cancel(qtbot, monkey
     fresh_commit.setCommitString("中文")
     composer.inputMethodEvent(fresh_commit)
     assert composer.toPlainText() == "短句正文 中文"
+
+
+def test_candidate_focus_session_is_closed_and_restored(window, qtbot, monkeypatch):
+    from tg_chat_client import ui
+
+    monkeypatch.setattr(ui, "cancel_windows_composition", lambda hwnd: None)
+    composer = window.input
+    composer.phrase_aliases = {"nh": "短句正文"}
+    composer.setPlainText(";")
+    composer.moveCursor(QTextCursor.MoveOperation.End)
+    composer.setFocus()
+    qtbot.waitUntil(composer.hasFocus)
+    lost_focus = []
+
+    def focus_changed(previous, current):
+        if previous is composer:
+            lost_focus.append(True)
+            # Some IMEs flush the old candidate when the editable focus is removed.
+            event = QInputMethodEvent("", [])
+            event.setCommitString("你好")
+            composer.inputMethodEvent(event)
+
+    QApplication.instance().focusChanged.connect(focus_changed)
+    try:
+        composer.inputMethodEvent(QInputMethodEvent("nh", []))
+        qtbot.waitUntil(lambda: not composer.resetting_input_method)
+        assert lost_focus
+        assert composer.hasFocus()
+        assert composer.testAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled)
+        assert composer.toPlainText() == "短句正文"
+        qtbot.keyClick(composer, Qt.Key.Key_Space)
+        assert composer.toPlainText() == "短句正文 "
+    finally:
+        QApplication.instance().focusChanged.disconnect(focus_changed)
+
+
+def test_ime_focus_restore_does_not_steal_focus_from_another_field(window, qtbot, monkeypatch):
+    from tg_chat_client import ui
+
+    monkeypatch.setattr(ui, "cancel_windows_composition", lambda hwnd: None)
+    composer = window.input
+    composer.phrase_aliases = {"nh": "短句正文"}
+    composer.setPlainText(";")
+    composer.moveCursor(QTextCursor.MoveOperation.End)
+    composer.setFocus()
+    qtbot.waitUntil(composer.hasFocus)
+    composer.inputMethodEvent(QInputMethodEvent("nh", []))
+    composer.ime_reset_timer.stop()
+    composer.finish_ime_reset()
+    assert not composer.testAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled)
+    window.search.setFocus()
+    qtbot.waitUntil(lambda: not composer.resetting_input_method)
+    assert window.search.hasFocus()
+    assert composer.testAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled)
+    assert composer.toPlainText() == "短句正文"
 
 
 def test_ime_prefix_commit_and_candidate_can_arrive_together(window, qtbot):

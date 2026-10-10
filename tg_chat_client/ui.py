@@ -4,8 +4,16 @@ import time
 from dataclasses import replace
 from uuid import uuid4
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QInputMethodEvent, QKeyEvent, QPixmap, QTextCursor
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QInputMethodEvent,
+    QKeyEvent,
+    QMouseEvent,
+    QPixmap,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -48,6 +56,9 @@ class Composer(QTextEdit):
         self.ime_reset_timer = QTimer(self)
         self.ime_reset_timer.setSingleShot(True)
         self.ime_reset_timer.timeout.connect(self.finish_ime_reset)
+        self.ime_restore_timer = QTimer(self)
+        self.ime_restore_timer.setSingleShot(True)
+        self.ime_restore_timer.timeout.connect(self.restore_ime_focus)
         self.phrase_prefix = ";"
         self.phrase_aliases = {}
         self.setPlaceholderText("输入消息；Enter 发送，Shift+Enter 换行")
@@ -114,6 +125,26 @@ class Composer(QTextEdit):
             if self.hasFocus():
                 QApplication.inputMethod().reset()
                 cancel_windows_composition(int(self.window().winId()))
+                # TSF input methods can retain candidates after an IMM cancellation.
+                # Remove the editable focus for one event-loop turn, then restore it.
+                self.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, False)
+                self.clearFocus()
+                self.ime_restore_timer.start(0)
+            super().inputMethodEvent(QInputMethodEvent("", []))
+        finally:
+            if not self.ime_restore_timer.isActive():
+                self.resetting_input_method = False
+            self.composing = False
+
+    def restore_ime_focus(self):
+        try:
+            self.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
+            if (
+                QApplication.focusWidget() is None
+                and self.window().isActiveWindow()
+                and self.isEnabled()
+            ):
+                self.setFocus(Qt.FocusReason.OtherFocusReason)
             super().inputMethodEvent(QInputMethodEvent("", []))
         finally:
             self.resetting_input_method = False
@@ -472,8 +503,10 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout(central)
         toolbar = QHBoxLayout()
         self.settings_button = QPushButton("连接设置")
+        self.settings_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.settings_button.pressed.connect(lambda: logger.info("Connection settings pressed"))
         self.settings_button.clicked.connect(lambda: self.open_connection_settings())
+        self.settings_button.setObjectName("connectionSettingsButton")
         toolbar.addWidget(self.settings_button)
         for text, callback in [
             ("添加 / 重新登录", self.open_login),
@@ -485,6 +518,16 @@ class MainWindow(QMainWindow):
             toolbar.addWidget(button)
         toolbar.addStretch()
         outer.addLayout(toolbar)
+        settings_menu = self.menuBar().addMenu("设置")
+        settings_action = QAction("连接设置", self)
+        settings_action.setShortcut("Ctrl+,")
+        settings_action.triggered.connect(lambda: self.open_connection_settings())
+        settings_menu.addAction(settings_action)
+        logger.info(
+            "UI ready: settings_enabled=%s settings_focus_policy=%s diagnostics=2",
+            self.settings_button.isEnabled(),
+            int(self.settings_button.focusPolicy()),
+        )
         self.notice = QLabel(
             "模拟数据与真实账号数据完全分开。" if self.mock else "请配置代理并添加账号。"
         )
@@ -1244,6 +1287,15 @@ class ShortcutFilter(QWidget):
         self.window = window
 
     def eventFilter(self, watched, event):
+        if isinstance(event, QMouseEvent) and event.type() == QEvent.Type.MouseButtonPress:
+            button = self.window.settings_button
+            if button.rect().contains(button.mapFromGlobal(event.globalPosition().toPoint())):
+                logger.info(
+                    "Settings area mouse press: target=%s enabled=%s visible=%s",
+                    type(watched).__name__,
+                    button.isEnabled(),
+                    button.isVisible(),
+                )
         if isinstance(event, QKeyEvent) and event.type() == event.Type.KeyPress:
             window = self.window
             if QApplication.activeWindow() is not window:

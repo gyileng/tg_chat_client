@@ -15,7 +15,10 @@ def test_windows_candidate_cancel_releases_64_bit_context(monkeypatch, context):
     native_ime.cancel_windows_composition(hwnd)
     imm32.ImmGetContext.assert_called_once_with(hwnd)
     if context:
-        imm32.ImmNotifyIME.assert_called_once_with(context, 0x0015, 0x0004, 0)
+        assert imm32.ImmNotifyIME.call_args_list == [
+            ((context, 0x0015, 0x0004, 0),),
+            ((context, 0x0011, 0, 0),),
+        ]
         imm32.ImmReleaseContext.assert_called_once_with(hwnd, context)
         assert imm32.ImmGetContext.restype is native_ime.wintypes.HANDLE
     else:

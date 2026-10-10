@@ -24,6 +24,10 @@ def cancel_windows_composition(hwnd):
     try:
         # NI_COMPOSITIONSTR / CPS_CANCEL clears the composition; it does not commit it.
         cancelled = imm32.ImmNotifyIME(context, 0x0015, 0x0004, 0)
-        logger.info("Native IME cancellation: success=%s", bool(cancelled))
+        # Candidate lists are a separate state (not all IMEs close them on CPS_CANCEL).
+        closed = imm32.ImmNotifyIME(context, 0x0011, 0, 0)  # NI_CLOSECANDIDATE, list 0
+        logger.info(
+            "Native IME cancellation: composition=%s candidates=%s", bool(cancelled), bool(closed)
+        )
     finally:
         imm32.ImmReleaseContext(hwnd, context)
