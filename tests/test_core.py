@@ -100,11 +100,11 @@ class StoreTests(unittest.TestCase):
 
     def test_future_database_version_is_not_overwritten(self):
         with self.store.connect() as db:
-            db.execute("PRAGMA user_version=2")
+            db.execute("PRAGMA user_version=3")
         with self.assertRaises(RuntimeError):
             Store(self.root)
         with self.store.connect() as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
 
     def test_remove_clears_only_target_account_and_files(self):
         self.store.replace_phrases(["共享短句"])
@@ -160,3 +160,51 @@ class ConfigurationTests(unittest.TestCase):
         ]:
             with self.assertRaises(ValueError):
                 proxy.validate()
+
+
+def test_phrase_v1_migration_preserves_existing_data(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "client.sqlite3"
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE phrases (id INTEGER PRIMARY KEY, text TEXT NOT NULL, position INTEGER NOT NULL);
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE sends (status TEXT);
+        INSERT INTO phrases VALUES (7, '原有短句', 0);
+        INSERT INTO settings VALUES ('other', 'true');
+        PRAGMA user_version=1;
+    """)
+    db.close()
+    store = Store(tmp_path)
+    assert store.phrases() == [{"id": 7, "text": "原有短句", "position": 0, "alias": None}]
+    assert store.phrase_prefix() == ";"
+    assert store.setting("other") is True
+    with store.connect() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert Store(tmp_path).phrases() == store.phrases()
+
+
+def test_phrase_alias_validation_is_atomic_and_persistent(tmp_path):
+    import pytest
+
+    store = Store(tmp_path)
+    store.replace_phrases([{"text": "你好", "alias": "NH"}, "仅点击"], prefix=";+")
+    before = store.phrases()
+    for records, prefix in [
+        ([{"text": "一", "alias": "nh"}, {"text": "二", "alias": "NH"}], ";"),
+        ([{"text": "一", "alias": "不合法"}], ";"),
+        ([{"text": "x" * 4097, "alias": "long"}], ";"),
+        (["一"], ""),
+        (["一"], "a"),
+        (["一"], "; "),
+    ]:
+        with pytest.raises(ValueError):
+            store.replace_phrases(records, prefix=prefix)
+        assert store.phrases() == before
+        assert store.phrase_prefix() == ";+"
+    restarted = Store(tmp_path)
+    assert restarted.phrases() == before
+    assert restarted.phrase_prefix() == ";+"
+    assert before[0]["alias"] == "nh"
+    assert before[1]["alias"] is None

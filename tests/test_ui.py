@@ -191,10 +191,7 @@ def test_shortcuts_do_not_fire_in_dialog(window, qtbot):
     "draft,start,end,expected",
     [("", 0, 0, "短句"), ("前后", 1, 1, "前短句后"), ("前替换后", 1, 3, "前短句后")],
 )
-@pytest.mark.parametrize("trigger", ["click", "shortcut"])
-def test_phrase_inserts_at_cursor_without_sending(
-    window, qtbot, draft, start, end, expected, trigger
-):
+def test_phrase_inserts_at_cursor_without_sending(window, qtbot, draft, start, end, expected):
     window.store.replace_phrases(["短句"])
     window.refresh_phrases()
     window.input.setPlainText(draft)
@@ -206,11 +203,7 @@ def test_phrase_inserts_at_cursor_without_sending(
     window.input.setTextCursor(cursor)
     window.activateWindow()
     qtbot.waitUntil(lambda: QApplication.activeWindow() is window)
-    if trigger == "click":
-        qtbot.mouseClick(window.phrase_layout.itemAt(0).widget(), Qt.MouseButton.LeftButton)
-    else:
-        window.input.setFocus()
-        qtbot.keyClick(window.input, Qt.Key.Key_1, Qt.KeyboardModifier.ControlModifier)
+    qtbot.mouseClick(window.phrase_layout.itemAt(0).widget(), Qt.MouseButton.LeftButton)
     assert window.input.toPlainText() == expected
     assert window.input.textCursor().position() == start + len("短句")
     assert window.input.hasFocus()
@@ -239,7 +232,7 @@ def test_alt_switches_accounts_and_preserves_inserted_draft(window, qtbot):
     assert not window.pending_sends
 
 
-def test_phrase_shortcut_ignores_repeat_and_ime(window, qtbot):
+def test_removed_phrase_shortcut_and_account_ime_guard(window, qtbot):
     window.store.replace_phrases(["短句"])
     window.refresh_phrases()
     window.input.setPlainText("草稿")
@@ -286,6 +279,8 @@ def test_ninth_account_shortcut_and_current_phrase_order(window, qtbot):
     window.activateWindow()
     qtbot.waitUntil(lambda: QApplication.activeWindow() is window)
     qtbot.keyClick(window.input, Qt.Key.Key_9, Qt.KeyboardModifier.ControlModifier)
+    assert window.input.toPlainText() == ""
+    window.phrase_layout.itemAt(8).widget().click()
     assert window.input.toPlainText() == "短句1"
     qtbot.keyClick(window.input, Qt.Key.Key_9, Qt.KeyboardModifier.AltModifier)
     assert window.accounts.currentRow() == 8
@@ -303,3 +298,147 @@ def test_phrase_insertion_during_send_preserves_new_draft(window, qtbot):
     qtbot.waitUntil(lambda: not window.pending_sends)
     assert window.input.toPlainText() == "提交内容后续草稿"
     assert window.store.count(*window.target) == 1
+
+
+@pytest.mark.parametrize(
+    "prefix,draft,position,expected",
+    [
+        (";", ";nh", 3, "你好"),
+        (";", "前;NH后", 4, "前你好后"),
+        (";+", "前;+nh后", 5, "前你好后"),
+        (";", "😀;nh", 5, "😀你好"),
+        (";", ";nhm", 4, "长缩写"),
+        (";", ";unknown", 8, ";unknown "),
+        (";", ";nhm", 3, ";nh m"),
+    ],
+)
+def test_alias_expansion_preserves_draft_and_quote(
+    window, qtbot, prefix, draft, position, expected
+):
+    window.store.replace_phrases(
+        [{"text": "你好", "alias": "nh"}, {"text": "长缩写", "alias": "nhm"}], prefix=prefix
+    )
+    window.refresh_phrases()
+    window.input.setPlainText(draft)
+    window.quote(window.messages.item(0))
+    reply = window.reply_id
+    cursor = window.input.textCursor()
+    cursor.setPosition(position)
+    window.input.setTextCursor(cursor)
+    qtbot.keyClick(window.input, Qt.Key.Key_Space)
+    assert window.input.toPlainText() == expected
+    assert window.reply_id == reply
+    assert window.store.draft(*window.target)["text"] == expected
+    assert not window.pending_sends
+    assert window.store.count(*window.target) == 0
+
+
+def test_expansion_undo_and_manual_send(window, qtbot):
+    window.store.replace_phrases([{"text": "你好", "alias": "nh"}])
+    window.refresh_phrases()
+    window.input.setPlainText("前;nh后")
+    cursor = window.input.textCursor()
+    cursor.setPosition(4)
+    window.input.setTextCursor(cursor)
+    qtbot.keyClick(window.input, Qt.Key.Key_Space)
+    assert window.input.toPlainText() == "前你好后"
+    assert window.input.textCursor().position() == 3
+    window.input.undo()
+    assert window.input.toPlainText() == "前;nh后"
+    window.input.redo()
+    qtbot.keyClick(window.input, Qt.Key.Key_Return)
+    qtbot.waitUntil(lambda: window.store.count(*window.target) == 1 and not window.pending_sends)
+    assert window.input.toPlainText() == ""
+
+
+def test_expansion_does_not_run_for_ime_selection_or_loading(qtbot):
+    composer = Composer()
+    qtbot.addWidget(composer)
+    composer.phrase_aliases = {"nh": "你好"}
+    composer.setPlainText(";nh")
+    assert composer.toPlainText() == ";nh"
+    composer.moveCursor(QTextCursor.MoveOperation.End)
+    composer.inputMethodEvent(QInputMethodEvent("拼音", []))
+    qtbot.keyClick(composer, Qt.Key.Key_Space)
+    assert "你好" not in composer.toPlainText()
+    composer.inputMethodEvent(QInputMethodEvent("", []))
+    composer.setPlainText(";nh")
+    composer.selectAll()
+    qtbot.keyClick(composer, Qt.Key.Key_Space)
+    assert composer.toPlainText() == " "
+    composer.setPlainText(";nh")
+    composer.moveCursor(QTextCursor.MoveOperation.End)
+    QApplication.sendEvent(
+        composer,
+        QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier, " ", True
+        ),
+    )
+    assert composer.toPlainText() == ";nh "
+
+
+def test_pasted_alias_and_expanded_content_do_not_expand_recursively(qtbot):
+    composer = Composer()
+    qtbot.addWidget(composer)
+    composer.phrase_aliases = {"nh": ";dj", "dj": "你好"}
+    QApplication.clipboard().setText(";nh ")
+    composer.paste()
+    assert composer.toPlainText() == ";nh "
+    composer.setPlainText(";nh")
+    composer.moveCursor(QTextCursor.MoveOperation.End)
+    qtbot.keyClick(composer, Qt.Key.Key_Space)
+    assert composer.toPlainText() == ";dj"
+
+
+def test_phrase_dialog_saves_alias_order_and_prefix(window, qtbot, monkeypatch):
+    from PySide6.QtWidgets import QDialog, QMessageBox
+
+    from tg_chat_client.ui import PhraseDialog
+
+    dialog = PhraseDialog(window.store, window)
+    qtbot.addWidget(dialog)
+    dialog.list.clear()
+    dialog.add_item({"text": "你好", "alias": "NH"})
+    dialog.add_item({"text": "共享", "alias": "nh"})
+    errors = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: errors.append(args[2]))
+    dialog.prefix.setText(";")
+    dialog.save()
+    assert errors and dialog.result() != QDialog.DialogCode.Accepted
+    dialog.list.takeItem(1)
+    dialog.add_item({"text": "点我", "alias": ""})
+    item = dialog.list.takeItem(1)
+    dialog.list.insertItem(0, item)
+    dialog.prefix.setText(";+")
+    dialog.save()
+    assert dialog.result() == QDialog.DialogCode.Accepted
+    window.refresh_phrases()
+    assert [p["text"] for p in window.phrases] == ["点我", "你好"]
+    assert window.input.phrase_prefix == ";+"
+    assert ";+nh" in window.phrase_layout.itemAt(1).widget().text()
+
+
+def test_expansion_during_send_and_switch_preserves_new_draft(window, qtbot):
+    window.store.replace_phrases([{"text": "新增草稿", "alias": "nh"}])
+    window.refresh_phrases()
+    first = window.target
+    window.input.setPlainText("原提交")
+    window.send_text(window.input.toPlainText(), "input")
+    assert window.pending_sends
+    window.input.setPlainText(";nh")
+    window.input.moveCursor(QTextCursor.MoveOperation.End)
+    qtbot.keyClick(window.input, Qt.Key.Key_Space)
+    assert window.input.toPlainText() == "新增草稿"
+    window.accounts.setCurrentRow(1)
+    qtbot.waitUntil(lambda: window.chat_id is not None)
+    window.input.setPlainText(";NH")
+    window.input.moveCursor(QTextCursor.MoveOperation.End)
+    qtbot.keyClick(window.input, Qt.Key.Key_Space)
+    assert window.input.toPlainText() == "新增草稿"
+    qtbot.waitUntil(lambda: not window.pending_sends)
+    assert window.store.count(*first) == 1
+    assert window.store.count(*window.target) == 0
+    assert window.store.draft(*first)["text"] == "新增草稿"
+    window.accounts.setCurrentRow(0)
+    qtbot.waitUntil(lambda: window.target == first)
+    assert window.input.toPlainText() == "新增草稿"

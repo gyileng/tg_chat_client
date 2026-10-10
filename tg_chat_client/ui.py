@@ -1,9 +1,10 @@
+import re
 import time
 from dataclasses import replace
 from uuid import uuid4
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QKeyEvent, QPixmap
+from PySide6.QtGui import QColor, QKeyEvent, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -12,7 +13,6 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -39,6 +39,8 @@ class Composer(QTextEdit):
     def __init__(self):
         super().__init__()
         self.composing = False
+        self.phrase_prefix = ";"
+        self.phrase_aliases = {}
         self.setPlaceholderText("输入消息；Enter 发送，Shift+Enter 换行")
         self.setMaximumHeight(110)
 
@@ -46,7 +48,42 @@ class Composer(QTextEdit):
         self.composing = bool(event.preeditString())
         super().inputMethodEvent(event)
 
+    def expand_phrase(self):
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            return False
+        before = QTextCursor(cursor)
+        before.setPosition(0, QTextCursor.MoveMode.KeepAnchor)
+        match = re.search(
+            re.escape(self.phrase_prefix) + r"([A-Za-z0-9_]+)$", before.selectedText()
+        )
+        if not match:
+            return False
+        text = self.phrase_aliases.get(match[1].lower())
+        if text is None:
+            return False
+        after = QTextCursor(cursor)
+        after.movePosition(QTextCursor.MoveOperation.NextCharacter, QTextCursor.MoveMode.KeepAnchor)
+        if re.match(r"[A-Za-z0-9_]", after.selectedText()):
+            return False
+        width = len(match[0].encode("utf-16-le")) // 2
+        cursor.beginEditBlock()
+        cursor.setPosition(cursor.position() - width, QTextCursor.MoveMode.KeepAnchor)
+        cursor.insertText(text)
+        cursor.endEditBlock()
+        self.setTextCursor(cursor)
+        return True
+
     def keyPressEvent(self, event):
+        if (
+            event.key() == Qt.Key.Key_Space
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and not self.composing
+            and not event.isAutoRepeat()
+            and self.expand_phrase()
+        ):
+            event.accept()
+            return
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if self.composing:
                 super().keyPressEvent(event)
@@ -132,8 +169,11 @@ class PhraseDialog(QDialog):
         layout = QVBoxLayout(self)
         self.list = QListWidget()
         self.list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        layout.addWidget(QLabel("共用前缀（一个或多个非空白符号）"))
+        self.prefix = QLineEdit(store.phrase_prefix())
+        layout.addWidget(self.prefix)
         for phrase in store.phrases():
-            self.list.addItem(phrase["text"])
+            self.add_item(phrase)
         layout.addWidget(self.list)
         actions = QHBoxLayout()
         for title, callback in [("添加", self.add), ("编辑", self.edit), ("删除", self.delete)]:
@@ -149,32 +189,62 @@ class PhraseDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def ask(self, text=""):
-        value, ok = QInputDialog.getMultiLineText(self, "短句", "每条最多 4096 字符", text)
-        if ok and value.strip():
-            if len(value) > 4096:
-                QMessageBox.information(self, "短句太长", "每条最多 4096 字符")
-            else:
-                return value.strip()
+    def add_item(self, phrase):
+        item = QListWidgetItem()
+        self.update_item(item, phrase)
+        self.list.addItem(item)
+
+    def update_item(self, item, phrase):
+        item.setData(Qt.ItemDataRole.UserRole, phrase)
+        item.setText((phrase.get("alias") or "未设缩写") + " · " + phrase["text"])
+
+    def ask(self, phrase=None):
+        phrase = phrase or {"text": "", "alias": ""}
+        dialog = QDialog(self)
+        dialog.setWindowTitle("短句")
+        layout = QFormLayout(dialog)
+        alias = QLineEdit(phrase.get("alias") or "")
+        text = QTextEdit()
+        text.setPlainText(phrase["text"])
+        layout.addRow("缩写（可空，字母/数字/下划线）", alias)
+        layout.addRow("正文（最多 4096 字符）", text)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted and text.toPlainText().strip():
+            return {"text": text.toPlainText().strip(), "alias": alias.text().strip().lower()}
         return None
 
     def add(self):
         value = self.ask()
         if value:
-            self.list.addItem(value)
+            self.add_item(value)
 
     def edit(self):
         item = self.list.currentItem()
         if item:
-            value = self.ask(item.text())
+            value = self.ask(item.data(Qt.ItemDataRole.UserRole))
             if value:
-                item.setText(value)
+                self.update_item(item, value)
 
     def delete(self):
         self.list.takeItem(self.list.currentRow())
 
     def save(self):
-        self.store.replace_phrases([self.list.item(i).text() for i in range(self.list.count())])
+        try:
+            self.store.replace_phrases(
+                [
+                    self.list.item(i).data(Qt.ItemDataRole.UserRole)
+                    for i in range(self.list.count())
+                ],
+                prefix=self.prefix.text(),
+            )
+        except ValueError as exc:
+            QMessageBox.information(self, "无法保存短句", str(exc))
+            return
         self.accept()
 
 
@@ -412,8 +482,8 @@ class MainWindow(QMainWindow):
         phrase_panel = QWidget()
         phrase_panel.setMinimumWidth(180)
         phrase_panel_layout = QVBoxLayout(phrase_panel)
-        phrase_panel_layout.addWidget(QLabel("快捷短句 · Ctrl+1～9"))
-        phrase_hint = QLabel("点击或按快捷键插入，Enter 发送")
+        phrase_panel_layout.addWidget(QLabel("快捷短句"))
+        phrase_hint = QLabel("点击插入，或输入缩写后按空格展开；Enter 发送")
         phrase_hint.setWordWrap(True)
         phrase_panel_layout.addWidget(phrase_hint)
         phrase_panel_layout.addWidget(phrase_scroll, 1)
@@ -549,14 +619,15 @@ class MainWindow(QMainWindow):
         self.phrases = self.store.phrases()
         if not self.phrases:
             self.phrase_layout.addWidget(QLabel("尚无短句，点击“管理短句”添加。"))
-        for index, phrase in enumerate(self.phrases):
-            shortcut = f"Ctrl+{index + 1} · " if index < 9 else ""
-            button = QPushButton(
-                shortcut + phrase["text"].replace("\n", " ").replace("&", "&&")[:70]
-            )
+        self.input.phrase_prefix = self.store.phrase_prefix()
+        self.input.phrase_aliases = {p["alias"]: p["text"] for p in self.phrases if p["alias"]}
+        for phrase in self.phrases:
+            shortcut = self.input.phrase_prefix + phrase["alias"] + " · " if phrase["alias"] else ""
+            label = shortcut + phrase["text"].replace("\n", " ")[:70]
+            button = QPushButton(label.replace("&", "&&"))
             button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
             button.setStyleSheet("text-align: left; padding-left: 6px;")
-            button.setToolTip(phrase["text"])
+            button.setToolTip(shortcut + phrase["text"])
             button.clicked.connect(
                 lambda checked=False, text=phrase["text"]: self.insert_phrase(text)
             )
@@ -1052,17 +1123,10 @@ class ShortcutFilter(QWidget):
             index = event.key() - Qt.Key.Key_1
             modifiers = event.modifiers()
             if 0 <= index < 9:
-                if window.input.composing and modifiers in (
-                    Qt.KeyboardModifier.AltModifier,
-                    Qt.KeyboardModifier.ControlModifier,
-                ):
+                if window.input.composing and modifiers == Qt.KeyboardModifier.AltModifier:
                     return True
                 if modifiers == Qt.KeyboardModifier.AltModifier:
                     if not event.isAutoRepeat() and index < window.accounts.count():
                         window.accounts.setCurrentRow(index)
-                    return True
-                if modifiers == Qt.KeyboardModifier.ControlModifier:
-                    if not event.isAutoRepeat() and index < len(window.phrases):
-                        window.insert_phrase(window.phrases[index]["text"])
                     return True
         return False

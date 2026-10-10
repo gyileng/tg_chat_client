@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import sqlite3
 from contextlib import contextmanager
@@ -37,7 +38,7 @@ class Store:
     def _migrate(self):
         with self.connect() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version > 1:
+            if version > 2:
                 raise RuntimeError("数据来自较新的程序版本，请使用新版程序")
             if version == 0:
                 db.executescript("""
@@ -69,6 +70,12 @@ class Store:
                     );
                     PRAGMA user_version=1;
                 """)
+
+            if version < 2:
+                db.execute("BEGIN")
+                db.execute("ALTER TABLE phrases ADD COLUMN alias TEXT")
+                db.execute("CREATE UNIQUE INDEX phrases_alias ON phrases(alias)")
+                db.execute("PRAGMA user_version=2")
 
     def setting(self, key, default=None):
         with self.connect() as db:
@@ -148,13 +155,38 @@ class Store:
         with self.connect() as db:
             return [dict(r) for r in db.execute("SELECT * FROM phrases ORDER BY position,id")]
 
-    def replace_phrases(self, texts):
+    def phrase_prefix(self):
+        return self.setting("phrase_prefix", ";")
+
+    def replace_phrases(self, texts, prefix=None):
+        """Accept legacy text lists or records containing text and an optional alias."""
+        if prefix is not None and (
+            not prefix or any(c.isspace() or c.isalnum() or c == "_" for c in prefix)
+        ):
+            raise ValueError("前缀须为一个或多个非空白符号")
+        rows, aliases = [], set()
+        for item in texts:
+            text = (item if isinstance(item, str) else item["text"]).strip()
+            alias = "" if isinstance(item, str) else (item.get("alias") or "").strip().lower()
+            if alias and not re.fullmatch(r"[a-z0-9_]+", alias):
+                raise ValueError("缩写仅支持英文字母、数字和下划线")
+            if alias and alias in aliases:
+                raise ValueError(f"缩写重复：{alias}")
+            if not text:
+                continue
+            if len(text) > 4096:
+                raise ValueError("每条短句最多 4096 字符")
+            if alias:
+                aliases.add(alias)
+            rows.append((text, len(rows), alias or None))
         with self.connect() as db:
             db.execute("DELETE FROM phrases")
-            db.executemany(
-                "INSERT INTO phrases(text,position) VALUES(?,?)",
-                [(text.strip(), i) for i, text in enumerate(texts) if text.strip()],
-            )
+            db.executemany("INSERT INTO phrases(text,position,alias) VALUES(?,?,?)", rows)
+            if prefix is not None:
+                db.execute(
+                    "INSERT OR REPLACE INTO settings VALUES (?, ?)",
+                    ("phrase_prefix", json.dumps(prefix)),
+                )
 
     def pins(self, account_id):
         with self.connect() as db:
