@@ -85,9 +85,14 @@ def main(argv=None):
         prune_cache(root)
         bridge = ServiceBridge(store, args.mock)
         window = MainWindow(store, bridge, args.mock)
+        app.setQuitOnLastWindowClosed(window.tray is None)
+        app.installEventFilter(window)
+        window.quit_requested.connect(app.quit)
+        app.aboutToQuit.connect(window.shutdown)
+        app.commitDataRequest.connect(window.shutdown)
         window.show()
         if args.smoke_test:
-            QTimer.singleShot(3000, window.close)
+            QTimer.singleShot(3000, window.request_exit)
         return app.exec()
     except Exception as exc:
         message = (

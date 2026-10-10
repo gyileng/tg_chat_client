@@ -3,12 +3,16 @@ import time
 from dataclasses import replace
 from uuid import uuid4
 
-from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
+    QColor,
+    QIcon,
     QInputMethodEvent,
     QKeyEvent,
+    QPainter,
     QPixmap,
+    QPolygon,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -31,6 +35,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -565,10 +570,14 @@ class LoginDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
+    quit_requested = Signal()
+
     def __init__(self, store, bridge, mock=False):
         super().__init__()
         self.store, self.bridge, self.mock = store, bridge, mock
         self.closing = False
+        self.tray = None
+        self.hidden_dialogs = []
         self.account_id = None
         self.chat_id = None
         self.groups_cache = {}
@@ -595,6 +604,7 @@ class MainWindow(QMainWindow):
         self.preview_timer.setSingleShot(True)
         self.preview_timer.timeout.connect(self.visible_previews)
         self.build_ui()
+        self.setup_tray()
         self.bridge.event.connect(self.handle)
         self.refresh_accounts()
         self.refresh_phrases()
@@ -640,6 +650,9 @@ class MainWindow(QMainWindow):
         settings_action.setShortcut("Ctrl+,")
         settings_action.triggered.connect(lambda: self.open_connection_settings())
         settings_menu.addAction(settings_action)
+        application_menu = self.menuBar().addMenu("程序")
+        self.exit_action = application_menu.addAction("退出")
+        self.exit_action.triggered.connect(self.request_exit)
         self.notice = QLabel(
             "模拟数据与真实账号数据完全分开。" if self.mock else "请配置代理并添加账号。"
         )
@@ -804,6 +817,8 @@ class MainWindow(QMainWindow):
         self.login_dialog.show()
 
     def login_finished(self):
+        if self.login_dialog in self.hidden_dialogs:
+            self.hidden_dialogs.remove(self.login_dialog)
         self.refresh_accounts()
         self.load_groups()
 
@@ -1292,7 +1307,11 @@ class MainWindow(QMainWindow):
                 else:
                     self.bottom.setText("有新消息 · 回到底部")
             return
-        if self.login_dialog and self.login_dialog.isVisible() and self.login_dialog.handle(event):
+        if (
+            self.login_dialog
+            and (self.login_dialog.isVisible() or self.login_dialog in self.hidden_dialogs)
+            and self.login_dialog.handle(event)
+        ):
             self.refresh_accounts()
             return
         if operation == "send":
@@ -1396,18 +1415,122 @@ class MainWindow(QMainWindow):
         )
         self.preview_timer.start(100)
 
-    def closeEvent(self, event):
+    def setup_tray(self):
+        # Draw the icon locally so frozen builds need no external image resources.
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#2386c8"))
+        painter.drawRoundedRect(2, 2, 60, 60, 14, 14)
+        painter.setBrush(QColor("white"))
+        painter.drawPolygon(
+            QPolygon(
+                [
+                    QPoint(12, 28),
+                    QPoint(52, 13),
+                    QPoint(39, 51),
+                    QPoint(29, 36),
+                    QPoint(22, 43),
+                    QPoint(22, 32),
+                ]
+            )
+        )
+        painter.end()
+        self.setWindowIcon(QIcon(pixmap))
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray.setToolTip("TG Chat Client — " + ("模拟模式" if self.mock else "真实模式"))
+        self.tray_menu = QMenu(self)
+        self.tray_menu.addAction("显示主窗口", self.restore_window)
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction(self.exit_action)
+        self.tray.setContextMenu(self.tray_menu)
+        self.tray.activated.connect(self.tray_activated)
+        self.tray.show()
+
+    def tray_activated(self, reason):
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.restore_window()
+
+    def restore_window(self):
         if self.closing:
-            event.accept()
+            return
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        dialogs, self.hidden_dialogs = self.hidden_dialogs, []
+        for dialog in dialogs:
+            if dialog in self.findChildren(QDialog):
+                dialog.show()
+                dialog.raise_()
+                dialog.activateWindow()
+
+    def request_exit(self):
+        if self.closing:
+            return
+        self.shutdown()
+        self.close()
+        self.quit_requested.emit()
+
+    def eventFilter(self, watched, event):
+        # QApplication.quit() closes windows before aboutToQuit. Mark a real exit
+        # first, otherwise closeEvent would turn that request into a tray hide.
+        if watched is QApplication.instance() and event.type() == QEvent.Type.Quit:
+            self.shutdown()
+        return super().eventFilter(watched, event)
+
+    def shutdown(self):
+        if self.closing:
             return
         self.closing = True
         self.save_view()
+        for dialog in self.findChildren(QDialog):
+            dialog.hide()
+        self.hidden_dialogs.clear()
         self.timer.stop()
         self.preview_timer.stop()
         self.message_resize_timer.stop()
         self.bridge.event.disconnect(self.handle)
         QApplication.instance().removeEventFilter(self.shortcut_filter)
+        if self.tray:
+            self.tray.hide()
         self.bridge.close()
+
+    def closeEvent(self, event):
+        if self.closing:
+            event.accept()
+            return
+        if self.tray and QSystemTrayIcon.isSystemTrayAvailable():
+            event.ignore()
+            if not self.store.setting("tray_hint_seen", False):
+                QMessageBox.information(
+                    self,
+                    "程序仍在运行",
+                    "关闭窗口后账号继续在线。\n点击右下角托盘图标恢复窗口；"
+                    "右键托盘图标选择“退出”，或通过“程序 → 退出”结束程序。",
+                )
+                self.store.set_setting("tray_hint_seen", True)
+                if self.closing:
+                    event.accept()
+                    return
+            self.save_view()
+            self.hidden_dialogs = [
+                d for d in self.findChildren(QDialog) if d.isVisible() or d in self.hidden_dialogs
+            ]
+            for dialog in self.hidden_dialogs:
+                dialog.hide()
+            self.hide()
+            return
+        self.shutdown()
+        if self.tray:
+            self.quit_requested.emit()
         event.accept()
 
 

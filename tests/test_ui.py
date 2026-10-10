@@ -5,12 +5,153 @@ import pytest
 pytest.importorskip("PySide6")
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QInputMethodEvent, QKeyEvent, QTextCursor
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QSystemTrayIcon
 
 from tg_chat_client.bridge import ServiceBridge
 from tg_chat_client.models import SendRequest
 from tg_chat_client.store import Store
 from tg_chat_client.ui import Composer, MainWindow
+
+
+@pytest.fixture(autouse=True)
+def no_desktop_tray(monkeypatch):
+    # Keep all existing tests independent of the host desktop (including Windows CI).
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", lambda: False)
+
+
+@pytest.fixture
+def tray_window(window, monkeypatch):
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", lambda: True)
+    monkeypatch.setattr(QSystemTrayIcon, "show", lambda self: None)
+    window.setup_tray()
+    window.store.set_setting("tray_hint_seen", True)
+    return window
+
+
+def test_tray_close_preserves_draft_quote_and_live_service(tray_window, qtbot):
+    window = tray_window
+    target = window.target
+    window.input.setPlainText("托盘草稿")
+    window.quote(window.messages.item(0))
+    reply = window.reply_id
+    bar = window.messages.verticalScrollBar()
+    bar.setValue(0)
+    window.close()
+    assert not window.isVisible()
+    assert not window.closing and not window.bridge.closed
+    assert window.timer.isActive()
+    assert window.store.draft(*target)["text"] == "托盘草稿"
+    assert window.store.draft(*target)["reply_id"] == reply
+    window.tray.activated.emit(QSystemTrayIcon.ActivationReason.Trigger)
+    qtbot.waitUntil(window.isVisible)
+    assert window.target == target
+    assert window.input.toPlainText() == "托盘草稿"
+    assert window.reply_id == reply
+    assert bar.value() == 0
+    assert not window.pending_sends
+    assert not window.windowIcon().isNull()
+    assert "模拟模式" in window.tray.toolTip()
+
+
+def test_tray_background_send_completes_without_clearing_next_draft(tray_window, qtbot):
+    window = tray_window
+    window.input.setPlainText("提交到托盘")
+    window.send_text(window.input.toPlainText(), "input")
+    assert window.pending_sends
+    window.input.setPlainText("下一条草稿")
+    window.close()
+    qtbot.waitUntil(lambda: not window.pending_sends)
+    assert not window.closing and not window.bridge.closed
+    assert not window.isVisible()
+    window.restore_window()
+    assert window.input.toPlainText() == "下一条草稿"
+    assert any(m.text == "提交到托盘" for m in window.buffers[window.target].values())
+
+
+def test_tray_restores_owned_dialog_without_accepting_it(tray_window):
+    window = tray_window
+    dialog = QDialog(window)
+    dialog.setWindowModality(Qt.WindowModality.WindowModal)
+    dialog.show()
+    finished = []
+    dialog.finished.connect(finished.append)
+    window.close()
+    assert not dialog.isVisible()
+    assert not finished
+    window.close()
+    window.showMinimized()
+    window.tray.activated.emit(QSystemTrayIcon.ActivationReason.DoubleClick)
+    assert window.isVisible() and not window.isMinimized()
+    assert dialog.isVisible()
+    assert not finished
+    dialog.reject()
+
+
+def test_tray_first_close_hint_is_only_shown_once(tray_window, monkeypatch):
+    window = tray_window
+    window.store.set_setting("tray_hint_seen", False)
+    hints = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: hints.append(args[2]))
+    window.close()
+    window.restore_window()
+    window.close()
+    assert len(hints) == 1 and "退出" in hints[0]
+    assert window.store.setting("tray_hint_seen")
+
+
+def test_login_result_while_hidden_does_not_reopen_completed_dialog(tray_window):
+    window = tray_window
+
+    class LoginResultDialog(QDialog):
+        def handle(self, event):
+            self.accept()
+            return True
+
+    dialog = LoginResultDialog(window)
+    window.login_dialog = dialog
+    dialog.accepted.connect(window.login_finished)
+    dialog.show()
+    window.close()
+    window.handle({"kind": "result", "operation": "sign_in", "result": {}})
+    assert dialog.result() == QDialog.DialogCode.Accepted
+    assert dialog not in window.hidden_dialogs
+    window.restore_window()
+    assert not dialog.isVisible()
+
+
+def test_tray_exit_cleans_up_once(tray_window, monkeypatch):
+    window = tray_window
+    calls = []
+    original_close = window.bridge.close
+
+    def close():
+        calls.append("close")
+        original_close()
+
+    monkeypatch.setattr(window.bridge, "close", close)
+    quit_requests = []
+    window.quit_requested.connect(lambda: quit_requests.append(True))
+    window.tray_menu.actions()[-1].trigger()
+    window.request_exit()
+    assert window.closing and window.bridge.closed
+    assert not window.timer.isActive()
+    assert not window.preview_timer.isActive()
+    assert not window.message_resize_timer.isActive()
+    assert not window.tray.isVisible()
+    assert calls == ["close"]
+    assert quit_requests == [True]
+
+
+def test_close_without_tray_exits(window):
+    assert window.tray is None
+    window.close()
+    assert window.closing and window.bridge.closed
+
+
+def test_close_when_tray_becomes_unavailable_exits(tray_window, monkeypatch):
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", lambda: False)
+    tray_window.close()
+    assert tray_window.closing and tray_window.bridge.closed
 
 
 def test_first_run_settings_can_reopen_after_saving_without_accounts(qtbot, tmp_path):
@@ -57,7 +198,7 @@ def test_first_run_settings_can_reopen_after_saving_without_accounts(qtbot, tmp_
     assert dialog.isVisible()
     assert dialog.port.value() == 7892
     dialog.reject()
-    window.close()
+    window.request_exit()
 
 
 def test_connection_settings_button_reopens_and_updates_proxy(window, qtbot, monkeypatch):
@@ -248,7 +389,7 @@ def window(qtbot, tmp_path):
     window.activateWindow()
     qtbot.waitUntil(lambda: window.accounts.count() == 5 and window.messages.count() >= 30)
     yield window
-    window.close()
+    window.request_exit()
 
 
 def test_startup_with_saved_account_initializes_preview_timer(qtbot, tmp_path):
@@ -262,7 +403,7 @@ def test_startup_with_saved_account_initializes_preview_timer(qtbot, tmp_path):
         assert window.preview_timer.isActive()
     finally:
         qtbot.waitUntil(lambda: window.statuses.get("saved-account") == "模拟连接")
-        window.close()
+        window.request_exit()
 
 
 def test_closed_window_ignores_late_group_result(window, qtbot, monkeypatch):
@@ -288,7 +429,7 @@ def test_closed_window_ignores_late_group_result(window, qtbot, monkeypatch):
     }
     # Model an already queued delivery: disconnecting the signal alone is insufficient.
     QTimer.singleShot(0, lambda: window.handle(event))
-    window.close()
+    window.request_exit()
     qtbot.wait(20)
     assert calls == []
     assert window.chat_id is None
@@ -307,7 +448,7 @@ def test_close_before_deferred_start_does_not_submit(qtbot, tmp_path, monkeypatc
         return original_submit(operation, **args)
 
     monkeypatch.setattr(bridge, "submit", submit)
-    window.close()
+    window.request_exit()
     qtbot.wait(20)
     assert calls == []
     assert bridge.closed
