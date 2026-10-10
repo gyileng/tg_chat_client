@@ -10,6 +10,14 @@ from pathlib import Path
 from .models import SendRequest, day_key
 
 
+def validate_phrase_alias(alias, aliases):
+    if alias and not re.fullmatch(r"[a-z0-9_]+", alias):
+        raise ValueError("缩写仅支持英文字母、数字和下划线")
+    for existing in aliases:
+        if alias and existing and (alias.startswith(existing) or existing.startswith(alias)):
+            raise ValueError(f"缩写冲突：{alias} 与 {existing} 重复或互为前缀，请换一个缩写")
+
+
 class Store:
     """Short-lived connections permit use from the UI and the service thread."""
 
@@ -168,10 +176,7 @@ class Store:
         for item in texts:
             text = (item if isinstance(item, str) else item["text"]).strip()
             alias = "" if isinstance(item, str) else (item.get("alias") or "").strip().lower()
-            if alias and not re.fullmatch(r"[a-z0-9_]+", alias):
-                raise ValueError("缩写仅支持英文字母、数字和下划线")
-            if alias and alias in aliases:
-                raise ValueError(f"缩写重复：{alias}")
+            validate_phrase_alias(alias, aliases)
             if not text:
                 continue
             if len(text) > 4096:

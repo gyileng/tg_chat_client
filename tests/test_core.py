@@ -193,6 +193,8 @@ def test_phrase_alias_validation_is_atomic_and_persistent(tmp_path):
     before = store.phrases()
     for records, prefix in [
         ([{"text": "一", "alias": "nh"}, {"text": "二", "alias": "NH"}], ";"),
+        ([{"text": "一", "alias": "wz"}, {"text": "二", "alias": "WZD"}], ";"),
+        ([{"text": "一", "alias": "wzd"}, {"text": "二", "alias": "WZ"}], ";"),
         ([{"text": "一", "alias": "不合法"}], ";"),
         ([{"text": "x" * 4097, "alias": "long"}], ";"),
         (["一"], ""),

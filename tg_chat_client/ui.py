@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from .models import ProxyConfig, SendRequest
+from .store import validate_phrase_alias
 
 
 class Composer(QTextEdit):
@@ -76,15 +77,6 @@ class Composer(QTextEdit):
         return True
 
     def keyPressEvent(self, event):
-        if (
-            event.key() == Qt.Key.Key_Space
-            and event.modifiers() == Qt.KeyboardModifier.NoModifier
-            and not self.composing
-            and not event.isAutoRepeat()
-            and self.expand_phrase()
-        ):
-            event.accept()
-            return
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if self.composing:
                 super().keyPressEvent(event)
@@ -94,7 +86,21 @@ class Composer(QTextEdit):
                     self.send_requested.emit()
                 event.accept()
                 return
+        expand = (
+            not self.composing
+            and not event.isAutoRepeat()
+            and not self.textCursor().hasSelection()
+            and not event.modifiers()
+            & (
+                Qt.KeyboardModifier.ControlModifier
+                | Qt.KeyboardModifier.AltModifier
+                | Qt.KeyboardModifier.MetaModifier
+            )
+            and bool(re.fullmatch(r"[A-Za-z0-9_]", event.text()))
+        )
         super().keyPressEvent(event)
+        if expand:
+            self.expand_phrase()
 
 
 class SettingsDialog(QDialog):
@@ -173,6 +179,9 @@ class PhraseDialog(QDialog):
         layout.addWidget(QLabel("共用前缀（一个或多个非空白符号）"))
         self.prefix = QLineEdit(store.phrase_prefix())
         layout.addWidget(self.prefix)
+        note = QLabel("输入完整触发串立即替换，无需空格；缩写不能重复或互为前缀。")
+        note.setWordWrap(True)
+        layout.addWidget(note)
         for phrase in store.phrases():
             self.add_item(phrase)
         layout.addWidget(self.list)
@@ -199,7 +208,7 @@ class PhraseDialog(QDialog):
         item.setData(Qt.ItemDataRole.UserRole, phrase)
         item.setText((phrase.get("alias") or "未设缩写") + " · " + phrase["text"])
 
-    def ask(self, phrase=None):
+    def ask(self, phrase=None, exclude=None):
         phrase = phrase or {"text": "", "alias": ""}
         dialog = QDialog(self)
         dialog.setWindowTitle("短句")
@@ -212,7 +221,30 @@ class PhraseDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.accepted.connect(dialog.accept)
+        error = QLabel()
+        error.setWordWrap(True)
+        layout.addRow(error)
+
+        def accept():
+            try:
+                validate_phrase_alias(
+                    alias.text().strip().lower(),
+                    [
+                        (self.list.item(i).data(Qt.ItemDataRole.UserRole).get("alias") or "")
+                        .strip()
+                        .lower()
+                        for i in range(self.list.count())
+                        if self.list.item(i) is not exclude
+                    ],
+                )
+                if not text.toPlainText().strip() or len(text.toPlainText().strip()) > 4096:
+                    raise ValueError("正文须为 1–4096 个字符")
+            except ValueError as exc:
+                error.setText(str(exc))
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(accept)
         buttons.rejected.connect(dialog.reject)
         layout.addRow(buttons)
         if dialog.exec() == QDialog.DialogCode.Accepted and text.toPlainText().strip():
@@ -227,7 +259,7 @@ class PhraseDialog(QDialog):
     def edit(self):
         item = self.list.currentItem()
         if item:
-            value = self.ask(item.data(Qt.ItemDataRole.UserRole))
+            value = self.ask(item.data(Qt.ItemDataRole.UserRole), exclude=item)
             if value:
                 self.update_item(item, value)
 
@@ -370,6 +402,9 @@ class MainWindow(QMainWindow):
         self.history_exhausted = set()
         self.setWindowTitle("TG Chat Client" + (" — 模拟模式（不会连接 Telegram）" if mock else ""))
         self.resize(1160, 780)
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.timeout.connect(self.visible_previews)
         self.build_ui()
         self.bridge.event.connect(self.handle)
         self.refresh_accounts()
@@ -377,9 +412,6 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_counts)
         self.timer.start(1000)
-        self.preview_timer = QTimer(self)
-        self.preview_timer.setSingleShot(True)
-        self.preview_timer.timeout.connect(self.visible_previews)
         self.shortcut_filter = ShortcutFilter(self)
         QApplication.instance().installEventFilter(self.shortcut_filter)
         QTimer.singleShot(0, lambda: self.bridge.submit("start"))
@@ -484,7 +516,7 @@ class MainWindow(QMainWindow):
         phrase_panel.setMinimumWidth(180)
         phrase_panel_layout = QVBoxLayout(phrase_panel)
         phrase_panel_layout.addWidget(QLabel("快捷短句"))
-        phrase_hint = QLabel("点击插入，或输入缩写后按空格展开；Enter 发送")
+        phrase_hint = QLabel("点击插入，或输入完整触发串立即替换；Enter 发送")
         phrase_hint.setWordWrap(True)
         phrase_panel_layout.addWidget(phrase_hint)
         phrase_panel_layout.addWidget(phrase_scroll, 1)
@@ -494,14 +526,18 @@ class MainWindow(QMainWindow):
         self.refresh_counts()
 
     def settings(self):
+        reason = ""
         if self.account_actions:
-            self.notice.setText("请等待账号操作完成。")
-            return
-        if self.mock:
-            self.notice.setText("模拟模式不使用 API 或代理；真实模式请不带 --mock 启动。")
-            return
-        if self.pending_sends:
-            self.notice.setText("请等待发送结束后再修改连接设置。")
+            reason = "请等待账号操作完成后再修改连接设置。"
+        elif self.mock:
+            reason = "模拟模式不使用 API 或代理；请关闭程序，不带 --mock 启动真实模式后修改。"
+        elif self.pending_sends:
+            reason = "请等待发送结束后再修改连接设置。"
+        elif self.login_dialog and self.login_dialog.isVisible():
+            reason = "请完成或取消登录，关闭登录窗口后再修改连接设置。"
+        if reason:
+            self.notice.setText(reason)
+            QMessageBox.information(self, "暂时无法修改连接设置", reason)
             return
         if SettingsDialog(self.store, self).exec() == QDialog.DialogCode.Accepted:
             self.reconnect()
@@ -622,6 +658,23 @@ class MainWindow(QMainWindow):
             self.phrase_layout.addWidget(QLabel("尚无短句，点击“管理短句”添加。"))
         self.input.phrase_prefix = self.store.phrase_prefix()
         self.input.phrase_aliases = {p["alias"]: p["text"] for p in self.phrases if p["alias"]}
+        aliases = self.input.phrase_aliases
+        conflicts = {
+            alias
+            for alias in aliases
+            if any(
+                alias != other and (alias.startswith(other) or other.startswith(alias))
+                for other in aliases
+            )
+        }
+        if conflicts:
+            warning = QLabel(
+                "部分旧缩写互为前缀，已暂停自动替换，请在“管理短句”修改："
+                + "、".join(sorted(conflicts))
+            )
+            warning.setWordWrap(True)
+            self.phrase_layout.addWidget(warning)
+            self.input.phrase_aliases = {a: t for a, t in aliases.items() if a not in conflicts}
         for phrase in self.phrases:
             shortcut = self.input.phrase_prefix + phrase["alias"] + " · " if phrase["alias"] else ""
             label = shortcut + phrase["text"].replace("\n", " ")[:70]
