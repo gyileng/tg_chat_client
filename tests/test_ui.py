@@ -91,27 +91,18 @@ def test_connection_settings_button_reopens_and_updates_proxy(window, qtbot, mon
     assert calls == ["reconnect"]
 
 
-def test_settings_dialog_is_owned_visible_and_clicks_are_logged(window, qtbot, caplog):
-    import logging
-
+def test_settings_dialog_is_owned_visible_and_reused(window, qtbot):
     from tg_chat_client.models import ProxyConfig
 
     window.mock = False
     window.store.save_connection(123, "test-private-hash", ProxyConfig(port=7892))
-    with caplog.at_level(logging.INFO, logger="tg_chat_client.ui"):
-        qtbot.mouseClick(window.settings_button, Qt.MouseButton.LeftButton)
-        dialog = window.settings_dialog
-        assert dialog.isVisible()
-        assert window.geometry().intersects(dialog.geometry())
-        window.open_connection_settings()
-        assert window.settings_dialog is dialog
-        dialog.reject()
-    assert "Connection settings pressed" in caplog.text
-    assert "Settings area mouse press" in caplog.text
-    assert "Connection settings requested" in caplog.text
-    assert "Connection settings shown" in caplog.text
-    assert "Connection settings finished" in caplog.text
-    assert "test-private-hash" not in caplog.text
+    qtbot.mouseClick(window.settings_button, Qt.MouseButton.LeftButton)
+    dialog = window.settings_dialog
+    assert dialog.isVisible()
+    assert window.geometry().intersects(dialog.geometry())
+    window.open_connection_settings()
+    assert window.settings_dialog is dialog
+    dialog.reject()
 
 
 def test_settings_button_tab_order_and_keyboard_activation(window, qtbot, monkeypatch):
@@ -338,6 +329,88 @@ def test_enter_sends_once_and_shift_enter_adds_newline(window, qtbot):
     assert "\n" in window.input.toPlainText()
 
 
+def test_submit_clears_immediately_and_success_preserves_identical_next_draft(
+    window, qtbot, monkeypatch
+):
+    calls = []
+    monkeypatch.setattr(window.bridge, "submit", lambda operation, **args: calls.append(args))
+    window.quote(window.messages.item(0))
+    reply_id = window.reply_id
+    window.input.setPlainText("重复短句")
+    qtbot.keyClick(window.input, Qt.Key.Key_Return)
+    request = calls[0]["request"]
+    assert request.reply_to == reply_id
+    assert window.input.toPlainText() == ""
+    assert window.store.draft(*window.target)["text"] == ""
+    assert window.reply_id is None
+
+    window.input.setPlainText("重复短句")
+    window.quote(window.messages.item(0))
+    qtbot.keyClick(window.input, Qt.Key.Key_Return)
+    assert len(calls) == 1
+    assert "上一条仍在发送" in window.notice.text()
+    message = replace(
+        next(iter(window.buffers[window.target].values())),
+        message_id=99999,
+        text=request.text,
+    )
+    window.handle({"kind": "result", "operation": "send", "request": request, "result": message})
+    assert window.input.toPlainText() == "重复短句"
+    assert window.reply_id == reply_id
+    qtbot.keyClick(window.input, Qt.Key.Key_Return)
+    assert len(calls) == 2
+    assert calls[1]["request"].text == "重复短句"
+    assert window.input.toPlainText() == ""
+    window.handle({"kind": "result", "operation": "send", "request": request, "result": message})
+    assert window.pending_sends[window.target][0] == calls[1]["request"]
+    window.pending_sends.clear()
+
+
+@pytest.mark.parametrize("next_draft", ["", "下一句"])
+@pytest.mark.parametrize("switch", [False, True])
+def test_send_failure_restores_text_without_losing_next_draft(
+    window, qtbot, monkeypatch, next_draft, switch
+):
+    calls = []
+    original_submit = window.bridge.submit
+
+    def submit(operation, **args):
+        if operation == "send":
+            calls.append(args["request"])
+        else:
+            return original_submit(operation, **args)
+
+    monkeypatch.setattr(window.bridge, "submit", submit)
+    target = window.target
+    window.quote(window.messages.item(0))
+    reply_id, reply_text = window.reply_id, window.reply_text
+    window.input.setPlainText("未成功文本")
+    qtbot.keyClick(window.input, Qt.Key.Key_Return)
+    window.input.setPlainText(next_draft)
+    if switch:
+        window.accounts.setCurrentRow(1)
+        qtbot.waitUntil(lambda: window.chat_id is not None)
+        window.input.setPlainText("其他账号草稿")
+    event = {
+        "kind": "error",
+        "operation": "send",
+        "request": calls[0],
+        "message": "发送结果不确定，请先查看群消息，不要直接重复发送",
+    }
+    window.handle(event)
+    expected = "未成功文本" + ("\n" + next_draft if next_draft else "")
+    draft = window.store.draft(*target)
+    assert draft["text"] == expected
+    assert draft["reply_id"] == (None if next_draft else reply_id)
+    assert draft["reply_text"] == ("" if next_draft else reply_text)
+    assert window.input.toPlainText() == ("其他账号草稿" if switch else expected)
+    assert "不确定" in window.notice.text()
+    assert "原文本已恢复" in window.notice.text()
+    window.handle(event)
+    assert window.store.draft(*target)["text"] == expected
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("browse_history", [False, True])
 def test_successful_send_returns_to_bottom(window, qtbot, browse_history):
     window.go_bottom()
@@ -524,7 +597,7 @@ def test_phrase_insertion_during_send_preserves_new_draft(window, qtbot):
     window.input.moveCursor(QTextCursor.MoveOperation.End)
     window.insert_phrase("后续草稿")
     qtbot.waitUntil(lambda: not window.pending_sends)
-    assert window.input.toPlainText() == "提交内容后续草稿"
+    assert window.input.toPlainText() == "后续草稿"
     assert window.store.count(*window.target) == 1
 
 

@@ -1,16 +1,14 @@
-import logging
 import re
 import time
 from dataclasses import replace
 from uuid import uuid4
 
-from PySide6.QtCore import QEvent, Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
     QInputMethodEvent,
     QKeyEvent,
-    QMouseEvent,
     QPixmap,
     QTextCursor,
 )
@@ -42,8 +40,6 @@ from PySide6.QtWidgets import (
 from .models import ProxyConfig, SendRequest
 from .native_ime import cancel_windows_composition
 from .store import validate_phrase_alias
-
-logger = logging.getLogger(__name__)
 
 
 class Composer(QTextEdit):
@@ -504,7 +500,6 @@ class MainWindow(QMainWindow):
         toolbar = QHBoxLayout()
         self.settings_button = QPushButton("连接设置")
         self.settings_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.settings_button.pressed.connect(lambda: logger.info("Connection settings pressed"))
         self.settings_button.clicked.connect(lambda: self.open_connection_settings())
         self.settings_button.setObjectName("connectionSettingsButton")
         toolbar.addWidget(self.settings_button)
@@ -523,11 +518,6 @@ class MainWindow(QMainWindow):
         settings_action.setShortcut("Ctrl+,")
         settings_action.triggered.connect(lambda: self.open_connection_settings())
         settings_menu.addAction(settings_action)
-        logger.info(
-            "UI ready: settings_enabled=%s settings_focus_policy=%s diagnostics=2",
-            self.settings_button.isEnabled(),
-            int(self.settings_button.focusPolicy()),
-        )
         self.notice = QLabel(
             "模拟数据与真实账号数据完全分开。" if self.mock else "请配置代理并添加账号。"
         )
@@ -616,7 +606,6 @@ class MainWindow(QMainWindow):
         self.refresh_counts()
 
     def open_connection_settings(self):
-        logger.info("Connection settings requested")
         if self.settings_dialog and self.settings_dialog.isVisible():
             self.settings_dialog.raise_()
             self.settings_dialog.activateWindow()
@@ -631,7 +620,6 @@ class MainWindow(QMainWindow):
         elif self.login_dialog and self.login_dialog.isVisible():
             reason = "请完成或取消登录，关闭登录窗口后再修改连接设置。"
         if reason:
-            logger.info("Connection settings blocked")
             self.notice.setText(reason)
             QMessageBox.information(self, "暂时无法修改连接设置", reason)
             return
@@ -645,14 +633,12 @@ class MainWindow(QMainWindow):
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
-        logger.info("Connection settings shown")
 
     def connection_settings_finished(self, result):
         dialog = self.settings_dialog
         self.settings_dialog = None
         if dialog:
             dialog.deleteLater()
-        logger.info("Connection settings finished: %s", result)
         if result == QDialog.DialogCode.Accepted:
             self.reconnect()
         else:
@@ -1089,15 +1075,24 @@ class MainWindow(QMainWindow):
         deadline = max(
             self.blocked.get(self.target, 0), self.blocked_accounts.get(self.account_id, 0)
         )
-        if self.target in self.pending_sends or deadline > time.monotonic():
+        if self.target in self.pending_sends:
+            self.notice.setText("上一条仍在发送，当前草稿已保留；发送结束后请再按 Enter。")
+            return
+        if deadline > time.monotonic():
+            self.notice.setText("Telegram 等待时间尚未结束，当前草稿已保留。")
             return
         if not text.strip() or len(text) > 4096:
             self.notice.setText("消息须为 1–4096 个字符。")
             return
         self.save_draft()
         request = SendRequest(uuid4().hex, self.account_id, self.chat_id, text, self.reply_id)
-        self.pending_sends[self.target] = (request, source)
         self.bridge.submit("send", request=request)
+        self.pending_sends[self.target] = (request, source, self.reply_text)
+        if source == "input":
+            self.reply_id, self.reply_text = None, ""
+            self.quote_label.setText("双击消息引用回复")
+            self.input.clear()
+            self.save_draft()
         self.notice.setText("正在发送；账号和目标群已固定。")
         self.refresh_counts()
 
@@ -1196,22 +1191,46 @@ class MainWindow(QMainWindow):
         if operation == "send":
             request = event["request"]
             target = request.account_id, request.chat_id
-            pending = self.pending_sends.pop(target, None)
+            pending = self.pending_sends.get(target)
+            if pending and pending[0].request_id != request.request_id:
+                return
+            self.pending_sends.pop(target, None)
             if kind == "result":
-                self.store.complete_draft(request, pending[1] if pending else "phrase")
+                if pending and pending[1] != "input":
+                    self.store.complete_draft(request, pending[1])
                 self.put_message(event["result"])
                 if target == self.target:
-                    self.restore_draft()
+                    if pending and pending[1] != "input":
+                        self.restore_draft()
                     self.append_visible(event["result"])
                     self.go_bottom()
                 self.notice.setText("发送成功。")
             else:
+                if pending and pending[1] == "input":
+                    draft = self.store.draft(*target)
+                    text = request.text + ("\n" + draft["text"] if draft["text"] else "")
+                    self.store.save_draft(
+                        *target,
+                        text,
+                        draft["reply_id"]
+                        if draft["text"] or draft["reply_id"] is not None
+                        else request.reply_to,
+                        draft["reply_text"]
+                        if draft["text"] or draft["reply_id"] is not None
+                        else pending[2],
+                    )
+                    if target == self.target:
+                        self.restore_draft()
                 if event.get("wait"):
                     if event.get("wait_scope") == "account":
                         self.blocked_accounts[request.account_id] = time.monotonic() + event["wait"]
                     else:
                         self.blocked[target] = time.monotonic() + event["wait"]
                 self.notice.setText(event["message"])
+                if pending and pending[1] == "input":
+                    self.notice.setText(
+                        event["message"] + "；原文本已恢复到该聊天草稿开头，请核对后手动发送。"
+                    )
         elif operation == "groups":
             aid = event["account_id"]
             if event["request_id"] != self.group_requests.get(aid):
@@ -1287,15 +1306,6 @@ class ShortcutFilter(QWidget):
         self.window = window
 
     def eventFilter(self, watched, event):
-        if isinstance(event, QMouseEvent) and event.type() == QEvent.Type.MouseButtonPress:
-            button = self.window.settings_button
-            if button.rect().contains(button.mapFromGlobal(event.globalPosition().toPoint())):
-                logger.info(
-                    "Settings area mouse press: target=%s enabled=%s visible=%s",
-                    type(watched).__name__,
-                    button.isEnabled(),
-                    button.isVisible(),
-                )
         if isinstance(event, QKeyEvent) and event.type() == event.Type.KeyPress:
             window = self.window
             if QApplication.activeWindow() is not window:
