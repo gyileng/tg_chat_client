@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 pytest.importorskip("PySide6")
@@ -6,6 +8,7 @@ from PySide6.QtGui import QInputMethodEvent, QKeyEvent, QTextCursor
 from PySide6.QtWidgets import QApplication
 
 from tg_chat_client.bridge import ServiceBridge
+from tg_chat_client.models import SendRequest
 from tg_chat_client.store import Store
 from tg_chat_client.ui import Composer, MainWindow
 
@@ -159,6 +162,55 @@ def test_enter_sends_once_and_shift_enter_adds_newline(window, qtbot):
     assert "\n" in window.input.toPlainText()
 
 
+@pytest.mark.parametrize("browse_history", [False, True])
+def test_successful_send_returns_to_bottom(window, qtbot, browse_history):
+    window.go_bottom()
+    bar = window.messages.verticalScrollBar()
+    if browse_history:
+        bar.setValue(0)
+        assert bar.value() < bar.maximum()
+    window.input.setPlainText("发送后应看到这条消息")
+    qtbot.keyClick(window.input, Qt.Key.Key_Return)
+    qtbot.waitUntil(lambda: window.store.count(*window.target) == 1 and not window.pending_sends)
+    qtbot.waitUntil(lambda: bar.value() == bar.maximum())
+    assert window.bottom.text() == "回到底部"
+    last = window.messages.item(window.messages.count() - 1)
+    assert window.messages.visualItemRect(last).intersects(window.messages.viewport().rect())
+
+
+def test_incoming_message_preserves_history_scroll(window, qtbot):
+    bar = window.messages.verticalScrollBar()
+    bar.setValue(0)
+    messages = window.buffers[window.target]
+    message = replace(
+        messages[max(messages)], message_id=max(messages) + 1, text="收到的新消息", outgoing=False
+    )
+    window.handle({"kind": "message", "message": message})
+    qtbot.wait(20)
+    assert bar.value() == 0
+    assert bar.value() < bar.maximum()
+    assert window.bottom.text() == "有新消息 · 回到底部"
+
+
+def test_other_account_send_result_preserves_scroll(window, qtbot):
+    original = window.target
+    messages = window.buffers[original]
+    message = replace(messages[max(messages)], message_id=max(messages) + 1, outgoing=True)
+    request = SendRequest("other-account-send", *original, message.text)
+    window.accounts.setCurrentRow(1)
+    qtbot.waitUntil(
+        lambda: (
+            window.chat_id is not None
+            and window.messages.count() >= 30
+            and window.target not in window.history_requests
+        )
+    )
+    bar = window.messages.verticalScrollBar()
+    bar.setValue(0)
+    window.handle({"kind": "result", "operation": "send", "request": request, "result": message})
+    assert bar.value() == 0
+
+
 def test_preview_fixture_is_displayable(window, qtbot):
     from PySide6.QtGui import QPixmap
     from PySide6.QtWidgets import QAbstractItemView
@@ -304,6 +356,11 @@ def test_phrase_insertion_during_send_preserves_new_draft(window, qtbot):
     "prefix,draft,position,expected",
     [
         (";", ";nh", 3, "你好"),
+        (";", "；nh", 3, "你好"),
+        ("；", ";NH", 3, "你好"),
+        (";+", "前；+nh后", 5, "前你好后"),
+        (";", "😀；nh", 5, "😀你好"),
+        (";", "；unknown", 8, "；unknown "),
         (";", "前;NH后", 4, "前你好后"),
         (";+", "前;+nh后", 5, "前你好后"),
         (";", "😀;nh", 5, "😀你好"),
@@ -333,10 +390,11 @@ def test_alias_expansion_preserves_draft_and_quote(
     assert window.store.count(*window.target) == 0
 
 
-def test_expansion_undo_and_manual_send(window, qtbot):
+@pytest.mark.parametrize("prefix", [";", "；"])
+def test_expansion_undo_and_manual_send(window, qtbot, prefix):
     window.store.replace_phrases([{"text": "你好", "alias": "nh"}])
     window.refresh_phrases()
-    window.input.setPlainText("前;nh后")
+    window.input.setPlainText(f"前{prefix}nh后")
     cursor = window.input.textCursor()
     cursor.setPosition(4)
     window.input.setTextCursor(cursor)
@@ -344,7 +402,7 @@ def test_expansion_undo_and_manual_send(window, qtbot):
     assert window.input.toPlainText() == "前你好后"
     assert window.input.textCursor().position() == 3
     window.input.undo()
-    assert window.input.toPlainText() == "前;nh后"
+    assert window.input.toPlainText() == f"前{prefix}nh后"
     window.input.redo()
     qtbot.keyClick(window.input, Qt.Key.Key_Return)
     qtbot.waitUntil(lambda: window.store.count(*window.target) == 1 and not window.pending_sends)

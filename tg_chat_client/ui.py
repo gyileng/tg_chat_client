@@ -54,9 +54,10 @@ class Composer(QTextEdit):
             return False
         before = QTextCursor(cursor)
         before.setPosition(0, QTextCursor.MoveMode.KeepAnchor)
-        match = re.search(
-            re.escape(self.phrase_prefix) + r"([A-Za-z0-9_]+)$", before.selectedText()
+        prefix_pattern = "".join(
+            "[;；]" if char in ";；" else re.escape(char) for char in self.phrase_prefix
         )
+        match = re.search(prefix_pattern + r"([A-Za-z0-9_]+)$", before.selectedText())
         if not match:
             return False
         text = self.phrase_aliases.get(match[1].lower())
@@ -1033,6 +1034,7 @@ class MainWindow(QMainWindow):
                 if target == self.target:
                     self.restore_draft()
                     self.append_visible(event["result"])
+                    self.go_bottom()
                 self.notice.setText("发送成功。")
             else:
                 if event.get("wait"):

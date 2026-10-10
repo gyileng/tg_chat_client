@@ -1,5 +1,18 @@
 # 会话交接
 
+## 发送后滚动与中文分号修复（2026-10-10）
+
+当前聊天发送成功后追加消息并回到底部；查看历史时收到普通新消息仍保留阅读位置，其他账号或群的发送结果不改变当前聊天滚动。短句前缀中的英文 `;` 与中文 `；` 等价匹配，默认 `;nh` 和 `；nh` 均可按空格展开；自定义组合前缀同样支持分号互换，其他符号保持精确匹配。
+
+新增回归覆盖底部发送、历史位置发送、收到消息保留位置、跨账号发送结果隔离，以及中文分号的展开、未知缩写、Unicode 光标和撤销。README、开发计划及包内说明已同步。本机 macOS Python 3.12.13、PySide6 6.12.0、Qt offscreen 下 78 项测试及 2 项子测试通过，Ruff 静态与格式检查、补丁空白检查通过。首轮已有图片预览测试因文件创建与读取时序失败，复跑整套通过；新增跨账号滚动测试改为在历史加载结束后注入发送结果，避免异步历史刷新干扰断言。本轮未连接 Telegram、未构建 Windows 包；Windows 输入法及新版包仍待实测。
+
+```bash
+rtk proxy env QT_QPA_PLATFORM=offscreen /private/tmp/tg-chat-venv/bin/python -m pytest -q
+rtk proxy /private/tmp/tg-chat-venv/bin/ruff check .
+rtk proxy /private/tmp/tg-chat-venv/bin/ruff format --check .
+rtk proxy git diff --check
+```
+
 ## 验证码请求报错修复（2026-10-10）
 
 用户报告配置本地混合代理端口后，获取验证码显示 `Request was unsuccessful 1 time(s)`。源码将 Telethon 的 `request_retries` 设为 0；Telegram 返回数据中心迁移要求时，Telethon 切换 DC 后无法继续请求，并用通用 ValueError 隐藏原始原因。该缺陷已离线复现，但未确认用户此次失败的底层原因，亦未连接用户代理或真实账号。
