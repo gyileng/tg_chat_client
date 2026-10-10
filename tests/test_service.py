@@ -1,7 +1,9 @@
 import asyncio
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from telethon.errors import FloodWaitError, PhoneMigrateError, SlowModeWaitError
@@ -50,6 +52,48 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def send(self, request):
         await self.runtime.execute("send", request.request_id, {"request": request})
+
+    async def test_sender_identity_survives_failed_name_lookup(self):
+        service = TelegramService(self.store, self.events.append)
+        for sender_id in (42, -100123, None):
+            message = SimpleNamespace(
+                get_sender=AsyncMock(side_effect=OSError("name unavailable")),
+                sender_id=sender_id,
+                chat_id=-1,
+                id=1,
+                raw_text="正文",
+                date=datetime.now(timezone.utc),
+                out=False,
+                reply_to_msg_id=None,
+                photo=None,
+                sticker=None,
+                video=None,
+                gif=None,
+                voice=None,
+                audio=None,
+                document=None,
+                media=None,
+            )
+            result = await service.convert("a", message)
+            self.assertEqual(result.sender_id, sender_id)
+            self.assertEqual(result.sender, "未知发送者")
+            self.assertEqual(result.text, "正文")
+
+    async def test_send_uses_returned_identity_without_extra_lookup(self):
+        service = TelegramService(self.store, self.events.append)
+        message = SimpleNamespace(
+            id=1,
+            sender_id=42,
+            date=datetime.now(timezone.utc),
+            get_sender=AsyncMock(side_effect=OSError("must not query")),
+        )
+        client = SimpleNamespace(send_message=AsyncMock(return_value=message))
+        with patch.object(service, "authorized", return_value=client):
+            result = await service.send(self.request())
+        self.assertEqual(result.sender_id, 42)
+        self.assertTrue(result.outgoing)
+        client.send_message.assert_awaited_once()
+        message.get_sender.assert_not_awaited()
 
     async def test_second_send_to_busy_target_is_rejected(self):
         first = asyncio.create_task(self.send(self.request()))

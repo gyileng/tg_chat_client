@@ -64,3 +64,4 @@ class ChatMessage:
     reply_to: int | None = None
     media: str = ""
     preview_path: str = ""
+    sender_id: int | None = None

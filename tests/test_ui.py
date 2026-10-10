@@ -1054,3 +1054,131 @@ def test_expansion_during_send_and_switch_preserves_new_draft(window, qtbot):
     window.accounts.setCurrentRow(0)
     qtbot.waitUntil(lambda: window.target == first)
     assert window.input.toPlainText() == "新增草稿"
+
+
+def test_message_bubbles_align_and_quote_from_bubble_and_blank_space(window, qtbot):
+    from PySide6.QtCore import QPoint
+
+    from tg_chat_client.models import ChatMessage
+    from tg_chat_client.ui import MessageRow
+
+    aid, chat = window.target
+    for mid, outgoing in ((9001, False), (9002, True)):
+        window.put_message(
+            ChatMessage(
+                aid, chat, mid, "<b>同名</b>", "短句", "12:00", outgoing=outgoing, sender_id=42
+            )
+        )
+    window.render_messages()
+    qtbot.wait(50)
+    incoming = window.messages.itemWidget(window.items[9001])
+    outgoing = window.messages.itemWidget(window.items[9002])
+    assert isinstance(outgoing, MessageRow)
+    assert incoming.name.text() == "<b>同名</b>"
+    assert outgoing.name.text() == "<b>同名</b>（我）"
+    assert incoming.name.textFormat() == Qt.TextFormat.PlainText
+    assert incoming.name.palette().color(
+        incoming.name.foregroundRole()
+    ) == outgoing.name.palette().color(outgoing.name.foregroundRole())
+    assert incoming.bubble.x() == 8
+    assert outgoing.bubble.geometry().right() >= outgoing.width() - 10
+    assert outgoing.bubble.width() < outgoing.width() * 0.75
+    item = window.items[9002]
+    window.messages.scrollToItem(item)
+    qtbot.wait(30)
+    rect = window.messages.visualItemRect(item)
+    bubble_point = rect.topLeft() + outgoing.bubble.geometry().center()
+    qtbot.mouseClick(window.messages.viewport(), Qt.MouseButton.LeftButton, pos=bubble_point)
+    qtbot.mouseDClick(window.messages.viewport(), Qt.MouseButton.LeftButton, pos=bubble_point)
+    assert window.reply_id == 9002
+    window.cancel_quote()
+    qtbot.mouseClick(
+        window.messages.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=QPoint(rect.left() + 4, rect.center().y()),
+    )
+    qtbot.mouseDClick(
+        window.messages.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=QPoint(rect.left() + 4, rect.center().y()),
+    )
+    assert window.reply_id == 9002
+
+
+def test_message_context_menu_quotes_right_bubble(window, qtbot):
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QMenu
+
+    outgoing_item = next(
+        item
+        for item in window.items.values()
+        if window.buffers[window.target][item.data(Qt.ItemDataRole.UserRole)].outgoing
+    )
+    window.messages.scrollToItem(outgoing_item)
+    qtbot.wait(30)
+    row = window.messages.itemWidget(outgoing_item)
+    pos = window.messages.visualItemRect(outgoing_item).topLeft() + row.bubble.geometry().center()
+
+    def choose_reply():
+        menu = window.findChild(QMenu)
+        menu.setActiveAction(menu.actions()[0])
+        qtbot.keyClick(menu, Qt.Key.Key_Return)
+
+    QTimer.singleShot(0, choose_reply)
+    window.message_menu(pos)
+    assert window.reply_id == outgoing_item.data(Qt.ItemDataRole.UserRole)
+
+
+def test_message_resize_wraps_text_and_scales_preview(window, qtbot, tmp_path):
+    from PySide6.QtGui import QPixmap
+    from PySide6.QtWidgets import QLabel
+
+    from tg_chat_client.models import ChatMessage
+
+    path = tmp_path / "preview.png"
+    image = QPixmap(800, 600)
+    image.fill(Qt.GlobalColor.blue)
+    image.save(str(path))
+    aid, chat = window.target
+    message = ChatMessage(
+        aid,
+        chat,
+        9003,
+        "长昵称" * 30,
+        "长正文" * 200,
+        "12:00",
+        media="photo",
+        preview_path=str(path),
+        sender_id=9,
+    )
+    window.put_message(message)
+    window.render_messages()
+    qtbot.wait(50)
+    row = window.messages.itemWidget(window.items[9003])
+    wide_width, wide_height = row.bubble.width(), row.bubble.height()
+    window.resize(850, 650)
+    qtbot.wait(50)
+    row = window.messages.itemWidget(window.items[9003])
+    assert row.bubble.width() < wide_width
+    assert row.bubble.width() <= (window.messages.viewport().width() - 16) * 0.75
+    assert row.bubble.height() > wide_height
+    assert row.media.pixmap().width() <= row.bubble.width() - 20
+    assert row.findChild(QLabel, "messageText").wordWrap()
+    assert window.messages.horizontalScrollBar().maximum() == 0
+    window.messages.verticalScrollBar().setValue(0)
+    window.resize(1000, 700)
+    qtbot.wait(50)
+    assert window.messages.verticalScrollBar().value() == 0
+    window.messages.scrollToBottom()
+    window.resize(1100, 700)
+    qtbot.wait(50)
+    bar = window.messages.verticalScrollBar()
+    assert bar.value() == bar.maximum()
+
+
+def test_sender_color_is_stable_with_missing_identity():
+    from tg_chat_client.ui import sender_color
+
+    assert sender_color(None) == "#666666"
+    assert sender_color(42) == sender_color(42)
+    assert sender_color(42) != sender_color(43)

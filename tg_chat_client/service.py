@@ -31,7 +31,18 @@ class MockService:
             self.emit({"kind": "status", "account_id": aid, "status": self.mock_status(aid)})
             for chat_id in (-1001, -1002):
                 self.messages[aid, chat_id] = [
-                    ChatMessage(aid, chat_id, i, "模拟群友", f"模拟消息 {i}", "12:00")
+                    ChatMessage(
+                        aid,
+                        chat_id,
+                        i,
+                        "我" if i % 7 == 0 else f"模拟群友 {(i - 1) // 2 % 4 + 1}",
+                        f"模拟消息 {i}",
+                        "12:00",
+                        outgoing=i % 7 == 0,
+                        sender_id=100 + zlib.crc32(aid.encode())
+                        if i % 7 == 0
+                        else (i - 1) // 2 % 4 + 1,
+                    )
                     for i in range(1, 31)
                 ]
                 self.messages[aid, chat_id][4] = replace(
@@ -47,7 +58,13 @@ class MockService:
                     continue
                 self.ids += 1
                 message = ChatMessage(
-                    account["id"], -1001, self.ids, "模拟群友", "新的模拟消息", "12:01"
+                    account["id"],
+                    -1001,
+                    self.ids,
+                    f"模拟群友 {self.ids % 4 + 1}",
+                    "新的模拟消息",
+                    "12:01",
+                    sender_id=self.ids % 4 + 1,
                 )
                 self.messages[account["id"], -1001].append(message)
                 self.emit({"kind": "message", "message": message})
@@ -80,6 +97,7 @@ class MockService:
             datetime.now().strftime("%H:%M"),
             True,
             request.reply_to,
+            sender_id=100 + zlib.crc32(request.account_id.encode()),
         )
         self.messages[request.account_id, request.chat_id].append(message)
         self.emit({"kind": "message", "message": message})
@@ -388,6 +406,7 @@ class TelegramService:
             bool(message.out),
             message.reply_to_msg_id,
             media,
+            sender_id=getattr(message, "sender_id", None),
         )
 
     async def history(self, account_id, chat_id, before=0):
@@ -415,6 +434,7 @@ class TelegramService:
             message.date.astimezone().strftime("%m-%d %H:%M"),
             True,
             request.reply_to,
+            sender_id=getattr(message, "sender_id", None),
         )
 
     async def preview(self, account_id, chat_id, message_id):

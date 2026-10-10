@@ -3,10 +3,9 @@ import time
 from dataclasses import replace
 from uuid import uuid4
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
-    QColor,
     QInputMethodEvent,
     QKeyEvent,
     QPixmap,
@@ -40,6 +39,124 @@ from PySide6.QtWidgets import (
 from .models import ProxyConfig, SendRequest
 from .native_ime import cancel_windows_composition
 from .store import validate_phrase_alias
+
+SENDER_COLORS = (
+    "#a33535",
+    "#98521b",
+    "#776013",
+    "#527020",
+    "#247044",
+    "#16716b",
+    "#236c89",
+    "#365dad",
+    "#6546a3",
+    "#864497",
+    "#a23e71",
+    "#735547",
+)
+
+
+def sender_color(sender_id):
+    return "#666666" if sender_id is None else SENDER_COLORS[sender_id % len(SENDER_COLORS)]
+
+
+class MessageList(QListWidget):
+    viewport_resized = Signal()
+
+    def viewportEvent(self, event):
+        result = super().viewportEvent(event)
+        if event.type() == QEvent.Type.Resize:
+            self.viewport_resized.emit()
+        return result
+
+
+class MessageRow(QWidget):
+    def __init__(self, message):
+        super().__init__()
+        # Let the list handle clicks on both bubbles and the surrounding blank space.
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(8, 4, 8, 4)
+        self.bubble = QWidget()
+        self.bubble.setObjectName("messageBubble")
+        background = "#e7f3ed" if message.outgoing else "#f1f3f5"
+        self.bubble.setStyleSheet(
+            f"QWidget#messageBubble {{ background: {background}; border-radius: 8px; }}"
+            "QWidget#messageBubble QLabel { background: transparent; color: #202124; }"
+        )
+        layout = QVBoxLayout(self.bubble)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(4)
+        name = message.sender
+        if message.outgoing and name != "我":
+            name += "（我）"
+        self.name = QLabel(name)
+        self.name.setObjectName("senderName")
+        self.name.setStyleSheet(f"color: {sender_color(message.sender_id)}; font-weight: bold;")
+        self.time = QLabel(
+            message.time + (f" · 回复 #{message.reply_to}" if message.reply_to else "")
+        )
+        self.time.setObjectName("messageTime")
+        self.time.setStyleSheet("color: #666666;")
+        self.labels = [self.name, self.time]
+        layout.addWidget(self.name)
+        if message.text:
+            text = QLabel(message.text)
+            text.setObjectName("messageText")
+            self.labels.append(text)
+            layout.addWidget(text)
+        self.preview = QPixmap(message.preview_path) if message.preview_path else QPixmap()
+        self.media = None
+        if message.media:
+            self.media = QLabel()
+            self.media.setObjectName("messageMedia")
+            if self.preview.isNull():
+                names = {
+                    "photo": "图片",
+                    "sticker": "贴纸",
+                    "video": "视频",
+                    "audio": "音频",
+                    "file": "文件",
+                }
+                self.media.setText(
+                    "["
+                    + names.get(message.media, "其他媒体")
+                    + "]"
+                    + (" 预览加载中或暂不可用" if message.media in {"photo", "sticker"} else "")
+                )
+                self.labels.append(self.media)
+            layout.addWidget(self.media)
+        layout.addWidget(self.time)
+        for label in self.labels:
+            label.setTextFormat(Qt.TextFormat.PlainText)
+        # Measure unwrapped text once; later resizing must not grow short bubbles.
+        self.natural_width = max(label.sizeHint().width() for label in self.labels) + 20
+        if not self.preview.isNull():
+            self.natural_width = max(self.natural_width, min(260, self.preview.width()) + 20)
+        for label in self.labels:
+            label.setWordWrap(True)
+            label.setMinimumWidth(0)
+        if message.outgoing:
+            row.addStretch()
+        row.addWidget(self.bubble)
+        if not message.outgoing:
+            row.addStretch()
+
+    def fit(self, viewport_width):
+        width = max(24, min(self.natural_width, int(max(0, viewport_width - 16) * 0.75)))
+        self.bubble.setFixedWidth(width)
+        if not self.preview.isNull():
+            self.media.setPixmap(
+                self.preview.scaled(
+                    max(1, min(260, width - 20)),
+                    200,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        height = self.bubble.layout().totalHeightForWidth(width)
+        self.bubble.setFixedHeight(height)
+        return QSize(0, height + 8)
 
 
 class Composer(QTextEdit):
@@ -568,7 +685,11 @@ class MainWindow(QMainWindow):
         self.bottom.clicked.connect(self.go_bottom)
         history_bar.addWidget(self.bottom)
         right_layout.addLayout(history_bar)
-        self.messages = QListWidget()
+        self.messages = MessageList()
+        self.message_resize_timer = QTimer(self)
+        self.message_resize_timer.setSingleShot(True)
+        self.message_resize_timer.timeout.connect(self.resize_messages)
+        self.messages.viewport_resized.connect(lambda: self.message_resize_timer.start(0))
         self.messages.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.messages.itemDoubleClicked.connect(self.quote)
         self.messages.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -946,7 +1067,7 @@ class MainWindow(QMainWindow):
         if item:
             menu = QMenu(self)
             action = menu.addAction("引用回复")
-            if menu.exec(self.messages.mapToGlobal(pos)) == action:
+            if menu.exec(self.messages.viewport().mapToGlobal(pos)) == action:
                 self.quote(item)
 
     def load_history(self, older=False):
@@ -984,8 +1105,6 @@ class MainWindow(QMainWindow):
         ):
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, message.message_id)
-            if message.outgoing:
-                item.setBackground(QColor("#e7f3ed"))
             self.messages.addItem(item)
             self.items[message.message_id] = item
             self.render_message(item, message)
@@ -1002,52 +1121,27 @@ class MainWindow(QMainWindow):
         self.preview_timer.start(100)
 
     def render_message(self, item, message):
-        if message.outgoing:
-            item.setBackground(QColor("#e7f3ed"))
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(8, 5, 8, 5)
-        header = QLabel(
-            f"{message.sender} · {message.time}"
-            + (f" · 回复 #{message.reply_to}" if message.reply_to else "")
-        )
-        header.setTextFormat(Qt.TextFormat.PlainText)
-        layout.addWidget(header)
-        if message.text:
-            text = QLabel(message.text)
-            text.setTextFormat(Qt.TextFormat.PlainText)
-            text.setWordWrap(True)
-            text.setMaximumWidth(max(300, self.messages.viewport().width() - 40))
-            layout.addWidget(text)
-        if message.media:
-            preview = QPixmap(message.preview_path) if message.preview_path else QPixmap()
-            label = QLabel()
-            if not preview.isNull():
-                label.setPixmap(
-                    preview.scaled(
-                        260,
-                        200,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                )
-            else:
-                names = {
-                    "photo": "图片",
-                    "sticker": "贴纸",
-                    "video": "视频",
-                    "audio": "音频",
-                    "file": "文件",
-                }
-                label.setText(
-                    "["
-                    + names.get(message.media, "其他媒体")
-                    + "]"
-                    + (" 预览加载中或暂不可用" if message.media in {"photo", "sticker"} else "")
-                )
-            layout.addWidget(label)
+        widget = MessageRow(message)
         self.messages.setItemWidget(item, widget)
-        item.setSizeHint(widget.sizeHint())
+        item.setSizeHint(widget.fit(self.messages.viewport().width()))
+
+    def resize_messages(self):
+        if self.closing:
+            return
+        bar = self.messages.verticalScrollBar()
+        old_value = bar.value()
+        at_bottom = old_value >= bar.maximum() - 4
+        self.rendering = True
+        for item in self.items.values():
+            widget = self.messages.itemWidget(item)
+            item.setSizeHint(widget.fit(self.messages.viewport().width()))
+        self.messages.doItemsLayout()
+        if at_bottom:
+            self.messages.scrollToBottom()
+        else:
+            bar.setValue(old_value)
+        self.rendering = False
+        self.preview_timer.start(100)
 
     def scrolled(self):
         if not self.closing and not self.rendering:
@@ -1310,6 +1404,7 @@ class MainWindow(QMainWindow):
         self.save_view()
         self.timer.stop()
         self.preview_timer.stop()
+        self.message_resize_timer.stop()
         self.bridge.event.disconnect(self.handle)
         QApplication.instance().removeEventFilter(self.shortcut_filter)
         self.bridge.close()
