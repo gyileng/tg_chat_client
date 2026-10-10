@@ -265,6 +265,54 @@ def test_startup_with_saved_account_initializes_preview_timer(qtbot, tmp_path):
         window.close()
 
 
+def test_closed_window_ignores_late_group_result(window, qtbot, monkeypatch):
+    from PySide6.QtCore import QTimer
+
+    aid = window.account_id
+    request_id = window.group_requests[aid]
+    window.chat_id = None
+    calls = []
+    original_submit = window.bridge.submit
+
+    def submit(operation, **args):
+        calls.append(operation)
+        return original_submit(operation, **args)
+
+    monkeypatch.setattr(window.bridge, "submit", submit)
+    event = {
+        "kind": "result",
+        "operation": "groups",
+        "account_id": aid,
+        "request_id": request_id,
+        "result": [{"id": -999, "title": "迟到的群列表"}],
+    }
+    # Model an already queued delivery: disconnecting the signal alone is insufficient.
+    QTimer.singleShot(0, lambda: window.handle(event))
+    window.close()
+    qtbot.wait(20)
+    assert calls == []
+    assert window.chat_id is None
+
+
+def test_close_before_deferred_start_does_not_submit(qtbot, tmp_path, monkeypatch):
+    store = Store(tmp_path)
+    bridge = ServiceBridge(store, mock=True)
+    window = MainWindow(store, bridge, mock=True)
+    qtbot.addWidget(window)
+    calls = []
+    original_submit = bridge.submit
+
+    def submit(operation, **args):
+        calls.append(operation)
+        return original_submit(operation, **args)
+
+    monkeypatch.setattr(bridge, "submit", submit)
+    window.close()
+    qtbot.wait(20)
+    assert calls == []
+    assert bridge.closed
+
+
 def test_switch_restores_draft_and_quote(window, qtbot):
     first = window.account_id
     window.input.setPlainText("账号一草稿")

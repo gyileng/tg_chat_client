@@ -451,6 +451,7 @@ class MainWindow(QMainWindow):
     def __init__(self, store, bridge, mock=False):
         super().__init__()
         self.store, self.bridge, self.mock = store, bridge, mock
+        self.closing = False
         self.account_id = None
         self.chat_id = None
         self.groups_cache = {}
@@ -485,13 +486,17 @@ class MainWindow(QMainWindow):
         self.timer.start(1000)
         self.shortcut_filter = ShortcutFilter(self)
         QApplication.instance().installEventFilter(self.shortcut_filter)
-        QTimer.singleShot(0, lambda: self.bridge.submit("start"))
+        QTimer.singleShot(0, self.start_service)
         if not mock and not store.export_settings():
             QTimer.singleShot(100, self.open_connection_settings)
 
     @property
     def target(self):
         return self.account_id, self.chat_id
+
+    def start_service(self):
+        if not self.closing:
+            self.bridge.submit("start")
 
     def build_ui(self):
         central = QWidget()
@@ -606,6 +611,8 @@ class MainWindow(QMainWindow):
         self.refresh_counts()
 
     def open_connection_settings(self):
+        if self.closing:
+            return
         if self.settings_dialog and self.settings_dialog.isVisible():
             self.settings_dialog.raise_()
             self.settings_dialog.activateWindow()
@@ -816,7 +823,7 @@ class MainWindow(QMainWindow):
         self.refresh_counts()
 
     def account_changed(self, current, previous):
-        if not current:
+        if self.closing or not current:
             return
         self.save_view()
         self.account_id = current.data(Qt.ItemDataRole.UserRole)
@@ -828,6 +835,8 @@ class MainWindow(QMainWindow):
         self.load_groups()
 
     def load_groups(self):
+        if self.closing:
+            return
         if self.account_id and self.statuses.get(self.account_id) in {"已连接", "模拟连接"}:
             request_id = self.bridge.submit("groups", account_id=self.account_id)
             self.group_requests[self.account_id] = request_id
@@ -865,7 +874,7 @@ class MainWindow(QMainWindow):
             self.groups.setCurrentRow(row)
 
     def group_changed(self, current, previous):
-        if not current:
+        if self.closing or not current:
             return
         chat_id = current.data(Qt.ItemDataRole.UserRole)
         if chat_id == self.chat_id:
@@ -941,7 +950,7 @@ class MainWindow(QMainWindow):
                 self.quote(item)
 
     def load_history(self, older=False):
-        if not self.account_id or self.chat_id is None:
+        if self.closing or not self.account_id or self.chat_id is None:
             return
         if self.target in self.history_requests:
             return
@@ -1041,10 +1050,12 @@ class MainWindow(QMainWindow):
         item.setSizeHint(widget.sizeHint())
 
     def scrolled(self):
-        if not self.rendering:
+        if not self.closing and not self.rendering:
             self.preview_timer.start(100)
 
     def visible_previews(self):
+        if self.closing:
+            return
         viewport = self.messages.viewport().rect()
         for mid, item in self.items.items():
             message = self.buffers.get(self.target, {}).get(mid)
@@ -1143,6 +1154,8 @@ class MainWindow(QMainWindow):
         self.send_button.setText("发送中…" if busy else "发送文字（Enter）")
 
     def handle(self, event):
+        if self.closing:
+            return
         kind = event["kind"]
         operation = event.get("operation")
         aid = event.get("account_id")
@@ -1290,9 +1303,14 @@ class MainWindow(QMainWindow):
         self.preview_timer.start(100)
 
     def closeEvent(self, event):
+        if self.closing:
+            event.accept()
+            return
+        self.closing = True
         self.save_view()
         self.timer.stop()
         self.preview_timer.stop()
+        self.bridge.event.disconnect(self.handle)
         QApplication.instance().removeEventFilter(self.shortcut_filter)
         self.bridge.close()
         event.accept()
