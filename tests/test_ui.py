@@ -10,6 +10,78 @@ from tg_chat_client.store import Store
 from tg_chat_client.ui import Composer, MainWindow
 
 
+def test_logout_preserves_draft_and_disables_send(window, qtbot, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    aid, chat = window.target
+    window.input.setPlainText("保留的草稿")
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    window.manage_account(aid, "logout")
+    qtbot.waitUntil(lambda: not window.account_actions)
+    assert window.store.draft(aid, chat)["text"] == "保留的草稿"
+    assert window.statuses[aid] == "需要登录"
+    assert window.accounts.count() == 5
+    assert not window.send_button.isEnabled()
+    window.send_text("不能发送", "input")
+    assert not window.pending_sends
+
+
+def test_remove_current_and_last_account_clears_view(window, qtbot, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    while window.store.accounts():
+        aid, chat = window.target
+        window.input.setPlainText("需要删除的草稿")
+        window.manage_account(aid, "remove_account")
+        qtbot.waitUntil(lambda: not window.account_actions)
+        assert not window.store.draft(aid, chat)["text"]
+        assert all(t[0] != aid for t in window.buffers)
+    assert window.account_id is None
+    assert window.chat_id is None
+    assert window.accounts.count() == 0
+    assert window.messages.count() == 0
+    assert window.input.toPlainText() == ""
+    assert not window.send_button.isEnabled()
+
+
+def test_cancel_remove_keeps_account(window, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.No)
+    window.manage_account(window.account_id, "remove_account")
+    assert window.accounts.count() == 5
+    assert not window.account_actions
+
+
+def test_remove_other_account_preserves_current_draft(window, qtbot, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    current = window.target
+    other = window.store.accounts()[1]["id"]
+    window.input.setPlainText("当前账号草稿")
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    window.manage_account(other, "remove_account")
+    qtbot.waitUntil(lambda: not window.account_actions)
+    assert window.target == current
+    assert window.input.toPlainText() == "当前账号草稿"
+    assert window.accounts.count() == 4
+
+
+def test_failed_remove_resets_controls_and_preserves_view(window):
+    aid, chat = window.target
+    window.input.setPlainText("失败时保留")
+    window.account_actions.add(aid)
+    window.handle(
+        {"kind": "error", "operation": "remove_account", "account_id": aid, "message": "退出失败"}
+    )
+    assert not window.account_actions
+    assert window.target == (aid, chat)
+    assert window.input.toPlainText() == "失败时保留"
+    assert window.accounts.count() == 5
+    assert window.notice.text() == "退出失败"
+
+
 @pytest.fixture
 def window(qtbot, tmp_path):
     store = Store(tmp_path)

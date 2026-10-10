@@ -2,7 +2,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from telethon.errors import FloodWaitError, SlowModeWaitError
 
@@ -99,6 +99,103 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.events[-1]["kind"], "error")
         self.service.release.set()
         await task
+
+    async def test_account_changes_are_rejected_while_sending(self):
+        task = asyncio.create_task(self.send(self.request()))
+        await asyncio.sleep(0)
+        for operation in ("logout", "remove_account"):
+            await self.runtime.execute(operation, operation, {"account_id": "a"})
+            self.assertIn("等待发送", self.events[-1]["message"])
+        self.service.release.set()
+        await task
+
+    async def test_logout_revokes_session_and_preserves_draft(self):
+        self.store.add_account("a", "A", "+123")
+        self.store.save_draft("a", -1, "保留")
+        path = self.store.root / "sessions" / "a.session"
+        path.write_text("fixture")
+        client = Mock()
+        client.is_connected.return_value = True
+        client.is_user_authorized = AsyncMock(return_value=True)
+        client.log_out = AsyncMock(return_value=True)
+        client.disconnect = AsyncMock()
+        service = TelegramService(self.store, self.events.append)
+        service.clients["a"] = client
+        await service.logout("a")
+        client.log_out.assert_awaited_once()
+        client.session.close.assert_called_once()
+        self.assertFalse(path.exists())
+        self.assertEqual(self.store.draft("a", -1)["text"], "保留")
+        self.assertEqual(len(self.store.accounts()), 1)
+        await service.reconnect()
+        self.assertEqual(self.events[-1]["status"], "需要登录")
+        await service.stop()
+
+    async def test_failed_logout_preserves_account_session_and_draft(self):
+        self.store.add_account("a", "A", "+123")
+        self.store.save_draft("a", -1, "保留")
+        path = self.store.root / "sessions" / "a.session"
+        path.write_text("fixture")
+        client = Mock()
+        client.is_connected.return_value = False
+        client.connect = AsyncMock()
+        client.is_user_authorized = AsyncMock(return_value=True)
+        client.log_out = AsyncMock(return_value=False)
+        client.disconnect = AsyncMock()
+        service = TelegramService(self.store, self.events.append)
+        with patch.object(service, "client", return_value=client):
+            with self.assertRaises(ValueError):
+                await service.remove_account("a")
+        self.assertTrue(path.exists())
+        self.assertEqual(len(self.store.accounts()), 1)
+        self.assertEqual(self.store.draft("a", -1)["text"], "保留")
+
+    async def test_remove_cancels_preview_before_cleanup_and_blocks_new_sends(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def preview(account_id):
+            entered.set()
+            await asyncio.Event().wait()
+
+        async def remove_account(account_id):
+            self.assertFalse(self.runtime.account_tasks)
+            entered.set()
+            await release.wait()
+
+        self.service.preview = preview
+        self.service.remove_account = remove_account
+        preview_task = asyncio.create_task(
+            self.runtime.execute("preview", "p", {"account_id": "a"})
+        )
+        await entered.wait()
+        entered.clear()
+        remove_task = asyncio.create_task(
+            self.runtime.execute("remove_account", "d", {"account_id": "a"})
+        )
+        await entered.wait()
+        await self.send(self.request())
+        self.assertIn("正在修改", self.events[-1]["message"])
+        self.assertFalse(self.service.calls)
+        release.set()
+        await remove_task
+        self.assertTrue(preview_task.cancelled())
+
+    async def test_mock_logout_and_remove_survive_restart(self):
+        mock = MockService(self.store, self.events.append)
+        await mock.start()
+        await mock.logout("mock-1")
+        await mock.reconnect()
+        with self.assertRaises(ValueError):
+            await mock.groups("mock-1")
+        for account in self.store.accounts():
+            await mock.remove_account(account["id"])
+        await mock.stop()
+        restarted = MockService(self.store, self.events.append)
+        await restarted.start()
+        self.assertFalse(self.store.accounts())
+        self.assertTrue(self.store.phrases())
+        await restarted.stop()
 
     async def test_mock_mode_seeds_five_accounts_and_quote_is_preserved(self):
         mock = MockService(self.store, self.events.append)

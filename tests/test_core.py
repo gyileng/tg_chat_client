@@ -106,6 +106,37 @@ class StoreTests(unittest.TestCase):
         with self.store.connect() as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
 
+    def test_remove_clears_only_target_account_and_files(self):
+        self.store.replace_phrases(["共享短句"])
+        for aid in ("a", "b"):
+            self.store.save_draft(aid, -1, "草稿")
+            self.store.toggle_pin(aid, -1)
+            request = self.request(aid, aid)
+            self.store.pending(request)
+            self.store.success(request, 1)
+            (self.root / "sessions" / f"{aid}.session").write_text("fixture")
+            folder = self.root / "cache" / aid
+            folder.mkdir()
+            (folder / "preview").write_text("fixture")
+        self.store.remove_account("a")
+        self.assertEqual([a["id"] for a in self.store.accounts()], ["b"])
+        with self.store.connect() as db:
+            for table in ("drafts", "pins", "sends", "counts"):
+                self.assertEqual(
+                    db.execute(f"SELECT COUNT(*) FROM {table} WHERE account_id='a'").fetchone()[0],
+                    0,
+                )
+        self.assertFalse((self.root / "sessions" / "a.session").exists())
+        self.assertFalse((self.root / "cache" / "a").exists())
+        self.assertTrue((self.root / "sessions" / "b.session").exists())
+        self.assertEqual(self.store.count("b"), 1)
+        self.assertEqual(self.store.phrases()[0]["text"], "共享短句")
+
+    def test_cleanup_rejects_path_traversal(self):
+        for aid in ("..", ".", "../a", "a/b", "a\\b"):
+            with self.assertRaises(ValueError):
+                self.store.clear_account_files(aid, cache=True)
+
 
 class ConfigurationTests(unittest.TestCase):
     def test_beijing_midnight(self):

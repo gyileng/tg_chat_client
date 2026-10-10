@@ -350,6 +350,9 @@ class MainWindow(QMainWindow):
         self.accounts = QListWidget()
         self.accounts.setMaximumHeight(250)
         self.accounts.currentItemChanged.connect(self.account_changed)
+        self.account_actions = set()
+        self.accounts.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.accounts.customContextMenuRequested.connect(self.account_menu)
         left_layout.addWidget(self.accounts)
         self.search = QLineEdit()
         self.search.setPlaceholderText("搜索已加入的群")
@@ -420,6 +423,9 @@ class MainWindow(QMainWindow):
         self.refresh_counts()
 
     def settings(self):
+        if self.account_actions:
+            self.notice.setText("请等待账号操作完成。")
+            return
         if self.mock:
             self.notice.setText("模拟模式不使用 API 或代理；真实模式请不带 --mock 启动。")
             return
@@ -430,13 +436,20 @@ class MainWindow(QMainWindow):
             self.reconnect()
 
     def reconnect(self):
-        if self.pending_sends or (self.login_dialog and self.login_dialog.isVisible()):
+        if (
+            self.pending_sends
+            or self.account_actions
+            or (self.login_dialog and self.login_dialog.isVisible())
+        ):
             self.notice.setText("请等待发送完成并关闭登录窗口后重新连接。")
             return
         self.notice.setText("正在重新连接…")
         self.bridge.submit("reconnect")
 
     def open_login(self):
+        if self.account_actions:
+            self.notice.setText("请等待账号操作完成。")
+            return
         if self.mock:
             self.notice.setText("模拟模式提供五个示例账号，不进行真实登录。")
             return
@@ -460,6 +473,73 @@ class MainWindow(QMainWindow):
     def manage_phrases(self):
         if PhraseDialog(self.store, self).exec() == QDialog.DialogCode.Accepted:
             self.refresh_phrases()
+
+    def account_menu(self, pos):
+        item = self.accounts.itemAt(pos)
+        if not item:
+            return
+        aid = item.data(Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        logout = menu.addAction("退出登录")
+        remove = menu.addAction("移除账号")
+        action = menu.exec(self.accounts.mapToGlobal(pos))
+        if action in (logout, remove):
+            self.manage_account(aid, "logout" if action == logout else "remove_account")
+
+    def manage_account(self, aid, operation):
+        if (
+            self.pending_sends
+            or self.account_actions
+            or (self.login_dialog and self.login_dialog.isVisible())
+        ):
+            self.notice.setText("请等待发送或账号操作完成，并关闭登录窗口。")
+            return
+        account = next((a for a in self.store.accounts() if a["id"] == aid), None)
+        if not account:
+            return
+        remove = operation == "remove_account"
+        title = "移除账号" if remove else "退出登录"
+        details = (
+            "将退出本工具的登录，并删除该账号的本地会话、草稿、常用群、缓存及发送统计。不会注销 Telegram 账号。"
+            if remove
+            else "将退出本工具的登录，保留账号、草稿和发送统计；再次使用需要重新登录。"
+        )
+        if (
+            QMessageBox.question(
+                self,
+                title,
+                f"{account['label']}\n{details}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        self.save_view()
+        self.account_actions.add(aid)
+        self.bridge.submit(operation, account_id=aid)
+        self.notice.setText(f"正在{title}…")
+        self.refresh_counts()
+
+    def clear_account_view(self, aid):
+        self.statuses.pop(aid, None)
+        self.groups_cache.pop(aid, None)
+        self.group_requests.pop(aid, None)
+        for mapping in (self.buffers, self.scroll_positions, self.history_requests):
+            for target in list(mapping):
+                if target[0] == aid:
+                    mapping.pop(target)
+        self.history_exhausted = {t for t in self.history_exhausted if t[0] != aid}
+        self.preview_requested = {t for t in self.preview_requested if t[0] != aid}
+        if self.account_id == aid:
+            # Do not save a removed account's draft while selecting the next account.
+            self.account_id = None
+            self.chat_id = None
+            self.groups.blockSignals(True)
+            self.groups.clear()
+            self.groups.blockSignals(False)
+            self.restore_draft()
+            self.render_messages()
 
     def refresh_phrases(self):
         while self.phrase_layout.count():
@@ -502,6 +582,8 @@ class MainWindow(QMainWindow):
             if selected == account["id"]:
                 self.accounts.setCurrentItem(item)
         self.accounts.blockSignals(False)
+        if selected and not any(a["id"] == selected for a in accounts):
+            self.clear_account_view(selected)
         if not self.accounts.currentItem() and self.accounts.count():
             self.accounts.setCurrentRow(0)
         self.refresh_counts()
@@ -519,7 +601,7 @@ class MainWindow(QMainWindow):
         self.load_groups()
 
     def load_groups(self):
-        if self.account_id:
+        if self.account_id and self.statuses.get(self.account_id) in {"已连接", "模拟连接"}:
             request_id = self.bridge.submit("groups", account_id=self.account_id)
             self.group_requests[self.account_id] = request_id
 
@@ -757,6 +839,9 @@ class MainWindow(QMainWindow):
         self.bottom.setText("回到底部")
 
     def send_text(self, text, source):
+        if self.account_actions or self.statuses.get(self.account_id) not in {"已连接", "模拟连接"}:
+            self.notice.setText("账号未连接或正在管理账号，请连接并登录后再发送。")
+            return
         if not self.account_id or self.chat_id is None:
             self.notice.setText("请先选择账号和群。")
             return
@@ -780,7 +865,9 @@ class MainWindow(QMainWindow):
         for i in range(self.accounts.count()):
             item = self.accounts.item(i)
             aid = item.data(Qt.ItemDataRole.UserRole)
-            account = accounts[aid]
+            account = accounts.get(aid)
+            if account is None:
+                continue
             shortcut = f"Alt+{i + 1} · " if i < 9 else ""
             item.setText(
                 f"{shortcut}{account['label']} · {self.store.count(aid)} 条\n"
@@ -792,7 +879,10 @@ class MainWindow(QMainWindow):
         )
         wait = max(0, int(deadline - time.monotonic()) + 1)
         busy = self.target in self.pending_sends
-        self.send_button.setEnabled(valid and not busy and not wait)
+        online = self.statuses.get(self.account_id) in {"已连接", "模拟连接"}
+        self.send_button.setEnabled(
+            valid and online and not self.account_actions and not busy and not wait
+        )
         self.phrase_widget.setEnabled(valid)
         self.input.setEnabled(valid)
         self.older.setEnabled(
@@ -819,12 +909,36 @@ class MainWindow(QMainWindow):
     def handle(self, event):
         kind = event["kind"]
         operation = event.get("operation")
+        aid = event.get("account_id")
+        if operation in {"logout", "remove_account"}:
+            self.account_actions.discard(aid)
+            if kind == "result":
+                self.clear_account_view(aid)
+                if operation == "logout":
+                    self.statuses[aid] = "需要登录"
+                self.refresh_accounts()
+                self.notice.setText(
+                    "账号已移除。"
+                    if operation == "remove_account"
+                    else "已退出登录，草稿和统计已保留。"
+                )
+            else:
+                self.notice.setText(event["message"])
+            self.refresh_counts()
+            return
+        if aid and not any(a["id"] == aid for a in self.store.accounts()):
+            return
         if kind == "status":
             self.statuses[event["account_id"]] = event["status"]
             self.refresh_counts()
             return
         if kind == "message":
             message = event["message"]
+            if (
+                not any(a["id"] == message.account_id for a in self.store.accounts())
+                or message.account_id in self.account_actions
+            ):
+                return
             target = self.put_message(message)
             if target == self.target:
                 bar = self.messages.verticalScrollBar()

@@ -21,13 +21,14 @@ class MockService:
         self.ticker = None
 
     async def start(self):
-        if not self.store.accounts():
+        if not self.store.accounts() and not self.store.setting("mock_initialized", False):
             for i in range(1, 6):
                 self.store.add_account(f"mock-{i}", f"模拟账号 {i}", f"mock-{i}")
             self.store.replace_phrases(["你好", "我也这样想", "谢谢分享", "收到"])
+        self.store.set_setting("mock_initialized", True)
         for account in self.store.accounts():
             aid = account["id"]
-            self.emit({"kind": "status", "account_id": aid, "status": "模拟连接"})
+            self.emit({"kind": "status", "account_id": aid, "status": self.mock_status(aid)})
             for chat_id in (-1001, -1002):
                 self.messages[aid, chat_id] = [
                     ChatMessage(aid, chat_id, i, "模拟群友", f"模拟消息 {i}", "12:00")
@@ -42,6 +43,8 @@ class MockService:
         while True:
             await asyncio.sleep(8)
             for account in self.store.accounts():
+                if self.mock_status(account["id"]) != "模拟连接":
+                    continue
                 self.ids += 1
                 message = ChatMessage(
                     account["id"], -1001, self.ids, "模拟群友", "新的模拟消息", "12:01"
@@ -55,14 +58,17 @@ class MockService:
             await asyncio.gather(self.ticker, return_exceptions=True)
 
     async def groups(self, account_id):
+        self.check_account(account_id)
         return [{"id": -1001, "title": "主要聊天群"}, {"id": -1002, "title": "其他聊天群"}]
 
     async def history(self, account_id, chat_id, before=0):
+        self.check_account(account_id)
         await asyncio.sleep(0.05)
         messages = self.messages.get((account_id, chat_id), [])
         return [m for m in messages if not before or m.message_id < before][-50:]
 
     async def send(self, request: SendRequest):
+        self.check_account(request.account_id)
         await asyncio.sleep(0.15)
         self.ids += 1
         message = ChatMessage(
@@ -103,7 +109,39 @@ class MockService:
 
     async def reconnect(self):
         for account in self.store.accounts():
-            self.emit({"kind": "status", "account_id": account["id"], "status": "模拟连接"})
+            self.emit(
+                {
+                    "kind": "status",
+                    "account_id": account["id"],
+                    "status": self.mock_status(account["id"]),
+                }
+            )
+
+    def mock_status(self, aid):
+        return "需要登录" if aid in self.store.setting("mock_logged_out", []) else "模拟连接"
+
+    def check_account(self, aid):
+        if (
+            not any(a["id"] == aid for a in self.store.accounts())
+            or self.mock_status(aid) != "模拟连接"
+        ):
+            raise ValueError("账号未连接或未登录")
+
+    async def logout(self, account_id):
+        logged_out = set(self.store.setting("mock_logged_out", []))
+        logged_out.add(account_id)
+        self.store.set_setting("mock_logged_out", sorted(logged_out))
+        self.emit({"kind": "status", "account_id": account_id, "status": "需要登录"})
+
+    async def remove_account(self, account_id):
+        self.store.remove_account(account_id)
+        self.store.set_setting(
+            "mock_logged_out",
+            [aid for aid in self.store.setting("mock_logged_out", []) if aid != account_id],
+        )
+        for target in list(self.messages):
+            if target[0] == account_id:
+                self.messages.pop(target)
 
 
 class TelegramService:
@@ -162,6 +200,9 @@ class TelegramService:
                     self.status(aid, "已连接" if client.is_connected() else "连接已断开")
 
     async def connect(self, aid):
+        if not (self.store.root / "sessions" / (aid + ".session")).exists():
+            self.status(aid, "需要登录")
+            return
         self.status(aid, "连接中")
         client = None
         try:
@@ -264,6 +305,35 @@ class TelegramService:
             if client:
                 await client.disconnect()
             self.status(account_id, "需要登录")
+
+    async def logout(self, account_id):
+        if not any(a["id"] == account_id for a in self.store.accounts()):
+            raise ValueError("账号不存在")
+        client = self.clients.pop(account_id, None)
+        self.codes.pop(account_id, None)
+        if client is None and (self.store.root / "sessions" / (account_id + ".session")).exists():
+            client = self.client(account_id)
+        try:
+            if client:
+                if not client.is_connected():
+                    await client.connect()
+                if await client.is_user_authorized() and not await client.log_out():
+                    raise ValueError("退出登录未成功，请检查连接后重试")
+        except BaseException:
+            self.status(account_id, "退出未完成：请重新连接后重试")
+            raise
+        finally:
+            if client:
+                await client.disconnect()
+                if client.session:
+                    client.session.close()
+        self.store.clear_account_files(account_id)
+        self.status(account_id, "需要登录")
+
+    async def remove_account(self, account_id):
+        # Keep all local records if server-side logout fails.
+        await self.logout(account_id)
+        self.store.remove_account(account_id)
 
     async def groups(self, account_id):
         return [
@@ -373,6 +443,7 @@ class ServiceRuntime:
         self.control_lock = asyncio.Lock()
         self.blocked_until = {}
         self.blocked_accounts = {}
+        self.account_tasks = {}
 
     async def execute(self, operation, request_id, args):
         # The service thread sets service before it starts the loop.
@@ -380,7 +451,13 @@ class ServiceRuntime:
         request = args.get("request")
         target = (request.account_id, request.chat_id) if request else None
         admitted = False
+        account_id = request.account_id if request else args.get("account_id")
+        task = asyncio.current_task()
         try:
+            if operation in {"send", "groups", "history", "preview"} and self.control_lock.locked():
+                raise ValueError("正在修改登录或连接，请稍后操作")
+            if operation in {"groups", "history", "preview"}:
+                self.account_tasks[task] = account_id
             if operation == "send":
                 if target in self.busy:
                     raise ValueError("该账号在这个群有发送请求尚未完成")
@@ -397,10 +474,23 @@ class ServiceRuntime:
                 self.store.pending(request)
                 result = await asyncio.wait_for(self.service.send(request), 30)
                 self.store.success(request, result.message_id)
-            elif operation in {"start", "reconnect", "request_code", "sign_in", "cancel_login"}:
+            elif operation in {
+                "start",
+                "reconnect",
+                "request_code",
+                "sign_in",
+                "cancel_login",
+                "logout",
+                "remove_account",
+            }:
                 async with self.control_lock:
                     if self.busy:
                         raise ValueError("请等待发送结束后再修改登录或连接")
+                    if operation in {"logout", "remove_account"}:
+                        pending = [t for t, aid in self.account_tasks.items() if aid == account_id]
+                        for pending_task in pending:
+                            pending_task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
                     result = await asyncio.wait_for(getattr(self.service, operation)(**args), 60)
             else:
                 result = await asyncio.wait_for(getattr(self.service, operation)(**args), 60)
@@ -468,6 +558,7 @@ class ServiceRuntime:
                 self.store.failed(request.request_id, unknown=True)
             raise
         finally:
+            self.account_tasks.pop(task, None)
             if admitted:
                 self.busy.discard(target)
 

@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -93,6 +94,29 @@ class Store:
     def last_chat(self, account_id, chat_id):
         with self.connect() as db:
             db.execute("UPDATE accounts SET last_chat=? WHERE id=?", (chat_id, account_id))
+
+    def clear_account_files(self, account_id, cache=False):
+        # IDs originate in the account table, but never allow paths outside the data directory.
+        if (
+            not account_id
+            or account_id in {".", ".."}
+            or Path(account_id).name != account_id
+            or "/" in account_id
+            or "\\" in account_id
+        ):
+            raise ValueError("账号标识无效")
+        for suffix in (".session", ".session-journal", ".session-wal", ".session-shm"):
+            (self.root / "sessions" / (account_id + suffix)).unlink(missing_ok=True)
+        folder = self.root / "cache" / account_id
+        if cache and folder.exists():
+            shutil.rmtree(folder)
+
+    def remove_account(self, account_id):
+        self.clear_account_files(account_id, cache=True)
+        with self.connect() as db:
+            for table in ("drafts", "pins", "sends", "counts"):
+                db.execute(f"DELETE FROM {table} WHERE account_id=?", (account_id,))
+            db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
 
     def draft(self, account_id, chat_id):
         with self.connect() as db:
