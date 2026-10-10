@@ -1,10 +1,8 @@
 import asyncio
 import logging
-import struct
 import zlib
 from dataclasses import replace
 from datetime import datetime
-from pathlib import Path
 from uuid import uuid4
 
 from .models import ChatMessage, ProxyConfig, SendRequest
@@ -46,7 +44,7 @@ class MockService:
                     for i in range(1, 31)
                 ]
                 self.messages[aid, chat_id][4] = replace(
-                    self.messages[aid, chat_id][4], media="photo", text="图片预览示例"
+                    self.messages[aid, chat_id][4], media="photo", text="图片占位示例"
                 )
         self.ticker = asyncio.create_task(self._tick())
 
@@ -103,28 +101,6 @@ class MockService:
         self.emit({"kind": "message", "message": message})
         return message
 
-    async def preview(self, account_id, chat_id, message_id):
-        path = self.store.root / "cache" / "mock.png"
-
-        # A fixture, not a real chat or downloaded asset.
-        def chunk(kind, data):
-            return (
-                struct.pack(">I", len(data))
-                + kind
-                + data
-                + struct.pack(">I", zlib.crc32(kind + data))
-            )
-
-        width, height = 260, 150
-        pixels = b"".join(b"\0" + bytes([80 + y // 2, 160, 220]) * width for y in range(height))
-        path.write_bytes(
-            b"\x89PNG\r\n\x1a\n"
-            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(pixels))
-            + chunk(b"IEND", b"")
-        )
-        return str(path)
-
     async def reconnect(self):
         for account in self.store.accounts():
             self.emit(
@@ -168,7 +144,6 @@ class TelegramService:
         self.clients = {}
         self.codes = {}
         self.monitor = None
-        self.media_slots = asyncio.Semaphore(3)
 
     def client(self, account_id):
         from telethon import TelegramClient
@@ -437,31 +412,6 @@ class TelegramService:
             sender_id=getattr(message, "sender_id", None),
         )
 
-    async def preview(self, account_id, chat_id, message_id):
-        async with self.media_slots:
-            client = self.authorized(account_id)
-            message = await client.get_messages(chat_id, ids=message_id)
-            if not message or not (message.photo or message.sticker):
-                return ""
-            folder = self.store.root / "cache" / account_id / str(chat_id)
-            folder.mkdir(parents=True, exist_ok=True)
-            prefix = folder / str(message_id)
-            existing = [p for p in folder.glob(f"{message_id}.*") if p.stat().st_size > 0]
-            if existing:
-                existing[0].touch()
-                return str(existing[0])
-            # Use thumbnails for photos as well, to avoid full-resolution downloads in a chat list.
-            thumb = None if getattr(message.file, "mime_type", "") == "image/webp" else -1
-            try:
-                result = await client.download_media(message, file=str(prefix), thumb=thumb) or ""
-                prune_cache(self.store.root)
-                return result
-            except BaseException:
-                # A canceled/failed download must not become a valid cached preview.
-                for partial in folder.glob(f"{message_id}.*"):
-                    partial.unlink(missing_ok=True)
-                raise
-
 
 class ServiceRuntime:
     """Async request execution and send accounting, independent of the GUI."""
@@ -485,9 +435,9 @@ class ServiceRuntime:
         account_id = request.account_id if request else args.get("account_id")
         task = asyncio.current_task()
         try:
-            if operation in {"send", "groups", "history", "preview"} and self.control_lock.locked():
+            if operation in {"send", "groups", "history"} and self.control_lock.locked():
                 raise ValueError("正在修改登录或连接，请稍后操作")
-            if operation in {"groups", "history", "preview"}:
+            if operation in {"groups", "history"}:
                 self.account_tasks[task] = account_id
             if operation == "send":
                 if target in self.busy:
@@ -592,13 +542,3 @@ class ServiceRuntime:
             self.account_tasks.pop(task, None)
             if admitted:
                 self.busy.discard(target)
-
-
-def prune_cache(root: Path, max_bytes=200 * 1024 * 1024):
-    files = [p for p in (root / "cache").rglob("*") if p.is_file()]
-    size = sum(p.stat().st_size for p in files)
-    for path in sorted(files, key=lambda p: p.stat().st_mtime):
-        if size <= max_bytes:
-            break
-        size -= path.stat().st_size
-        path.unlink(missing_ok=True)

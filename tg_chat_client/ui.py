@@ -1,9 +1,10 @@
 import re
 import time
-from dataclasses import replace
+from datetime import datetime, timedelta
+from math import ceil
 from uuid import uuid4
 
-from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -41,127 +42,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .models import ProxyConfig, SendRequest
+from .message_cache import MessageCache
+from .message_view import MESSAGE_ROLE, MessageList, media_text
+from .models import BEIJING, ProxyConfig, SendRequest, day_key
 from .native_ime import cancel_windows_composition
 from .store import validate_phrase_alias
-
-SENDER_COLORS = (
-    "#a33535",
-    "#98521b",
-    "#776013",
-    "#527020",
-    "#247044",
-    "#16716b",
-    "#236c89",
-    "#365dad",
-    "#6546a3",
-    "#864497",
-    "#a23e71",
-    "#735547",
-)
-
-
-def sender_color(sender_id):
-    return "#666666" if sender_id is None else SENDER_COLORS[sender_id % len(SENDER_COLORS)]
-
-
-class MessageList(QListWidget):
-    viewport_resized = Signal()
-
-    def viewportEvent(self, event):
-        result = super().viewportEvent(event)
-        if event.type() == QEvent.Type.Resize:
-            self.viewport_resized.emit()
-        return result
-
-
-class MessageRow(QWidget):
-    def __init__(self, message):
-        super().__init__()
-        # Let the list handle clicks on both bubbles and the surrounding blank space.
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        row = QHBoxLayout(self)
-        row.setContentsMargins(8, 4, 8, 4)
-        self.bubble = QWidget()
-        self.bubble.setObjectName("messageBubble")
-        background = "#e7f3ed" if message.outgoing else "#f1f3f5"
-        self.bubble.setStyleSheet(
-            f"QWidget#messageBubble {{ background: {background}; border-radius: 8px; }}"
-            "QWidget#messageBubble QLabel { background: transparent; color: #202124; }"
-        )
-        layout = QVBoxLayout(self.bubble)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(4)
-        name = message.sender
-        if message.outgoing and name != "我":
-            name += "（我）"
-        self.name = QLabel(name)
-        self.name.setObjectName("senderName")
-        self.name.setStyleSheet(f"color: {sender_color(message.sender_id)}; font-weight: bold;")
-        self.time = QLabel(
-            message.time + (f" · 回复 #{message.reply_to}" if message.reply_to else "")
-        )
-        self.time.setObjectName("messageTime")
-        self.time.setStyleSheet("color: #666666;")
-        self.labels = [self.name, self.time]
-        layout.addWidget(self.name)
-        if message.text:
-            text = QLabel(message.text)
-            text.setObjectName("messageText")
-            self.labels.append(text)
-            layout.addWidget(text)
-        self.preview = QPixmap(message.preview_path) if message.preview_path else QPixmap()
-        self.media = None
-        if message.media:
-            self.media = QLabel()
-            self.media.setObjectName("messageMedia")
-            if self.preview.isNull():
-                names = {
-                    "photo": "图片",
-                    "sticker": "贴纸",
-                    "video": "视频",
-                    "audio": "音频",
-                    "file": "文件",
-                }
-                self.media.setText(
-                    "["
-                    + names.get(message.media, "其他媒体")
-                    + "]"
-                    + (" 预览加载中或暂不可用" if message.media in {"photo", "sticker"} else "")
-                )
-                self.labels.append(self.media)
-            layout.addWidget(self.media)
-        layout.addWidget(self.time)
-        for label in self.labels:
-            label.setTextFormat(Qt.TextFormat.PlainText)
-        # Measure unwrapped text once; later resizing must not grow short bubbles.
-        self.natural_width = max(label.sizeHint().width() for label in self.labels) + 20
-        if not self.preview.isNull():
-            self.natural_width = max(self.natural_width, min(260, self.preview.width()) + 20)
-        for label in self.labels:
-            label.setWordWrap(True)
-            label.setMinimumWidth(0)
-        if message.outgoing:
-            row.addStretch()
-        row.addWidget(self.bubble)
-        if not message.outgoing:
-            row.addStretch()
-
-    def fit(self, viewport_width):
-        width = max(24, min(self.natural_width, int(max(0, viewport_width - 16) * 0.75)))
-        self.bubble.setFixedWidth(width)
-        if not self.preview.isNull():
-            self.media.setPixmap(
-                self.preview.scaled(
-                    max(1, min(260, width - 20)),
-                    200,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-            )
-        height = self.bubble.layout().totalHeightForWidth(width)
-        self.bubble.setFixedHeight(height)
-        return QSize(0, height + 8)
 
 
 class Composer(QTextEdit):
@@ -581,28 +466,38 @@ class MainWindow(QMainWindow):
         self.account_id = None
         self.chat_id = None
         self.groups_cache = {}
-        self.buffers = {}
-        self.items = {}
+        self.cache = MessageCache()
+        self.buffers = self.cache.recent
+        self.accounts_dirty = True
+        self.phrases_dirty = True
+        self.counts_dirty = True
+        self.ui_dirty = True
+        self.account_records = {a["id"]: a for a in store.accounts()}
+        self.counts_snapshot = {}
+        self.count_day = day_key()
+        self.resume_bottom = set()
+        self.draft_dirty = set()
+        self.notice_text = None
         self.statuses = {}
         self.pending_sends = {}
         self.blocked = {}
         self.blocked_accounts = {}
         self.group_requests = {}
         self.history_requests = {}
-        self.preview_requested = set()
+        self.history_before = {}
         self.login_dialog = None
         self.settings_dialog = None
         self.reply_id = None
         self.reply_text = ""
         self.loading_draft = False
         self.rendering = False
+        self.resize_pending = False
+        self.resize_anchor = None
+        self.resize_rendering_state = False
         self.scroll_positions = {}
         self.history_exhausted = set()
         self.setWindowTitle("TG Chat Client" + (" — 模拟模式（不会连接 Telegram）" if mock else ""))
         self.resize(1160, 780)
-        self.preview_timer = QTimer(self)
-        self.preview_timer.setSingleShot(True)
-        self.preview_timer.timeout.connect(self.visible_previews)
         self.build_ui()
         self.setup_tray()
         self.bridge.event.connect(self.handle)
@@ -610,7 +505,10 @@ class MainWindow(QMainWindow):
         self.refresh_phrases()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_counts)
-        self.timer.start(1000)
+        self.day_timer = QTimer(self)
+        self.day_timer.setSingleShot(True)
+        self.day_timer.timeout.connect(self.day_changed)
+        self.schedule_midnight()
         self.shortcut_filter = ShortcutFilter(self)
         QApplication.instance().installEventFilter(self.shortcut_filter)
         QTimer.singleShot(0, self.start_service)
@@ -695,16 +593,20 @@ class MainWindow(QMainWindow):
         self.older.clicked.connect(lambda: self.load_history(older=True))
         history_bar.addWidget(self.older)
         self.bottom = QPushButton("回到底部")
-        self.bottom.clicked.connect(self.go_bottom)
+        self.bottom.clicked.connect(lambda: self.go_bottom())
         history_bar.addWidget(self.bottom)
         right_layout.addLayout(history_bar)
         self.messages = MessageList()
         self.message_resize_timer = QTimer(self)
         self.message_resize_timer.setSingleShot(True)
         self.message_resize_timer.timeout.connect(self.resize_messages)
-        self.messages.viewport_resized.connect(lambda: self.message_resize_timer.start(0))
+        self.message_sync_timer = QTimer(self)
+        self.message_sync_timer.setSingleShot(True)
+        self.message_sync_timer.timeout.connect(self.render_messages)
+        self.messages.viewport_resizing.connect(self.prepare_message_resize)
+        self.messages.viewport_resized.connect(self.schedule_message_resize)
         self.messages.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.messages.itemDoubleClicked.connect(self.quote)
+        self.messages.doubleClicked.connect(self.quote)
         self.messages.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.messages.customContextMenuRequested.connect(self.message_menu)
         self.messages.verticalScrollBar().valueChanged.connect(self.scrolled)
@@ -761,10 +663,10 @@ class MainWindow(QMainWindow):
         elif self.login_dialog and self.login_dialog.isVisible():
             reason = "请完成或取消登录，关闭登录窗口后再修改连接设置。"
         if reason:
-            self.notice.setText(reason)
+            self.set_notice(reason)
             QMessageBox.information(self, "暂时无法修改连接设置", reason)
             return
-        self.notice.setText("正在打开连接设置…")
+        self.set_notice("正在打开连接设置…")
         dialog = SettingsDialog(self.store, self)
         self.settings_dialog = dialog
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
@@ -783,7 +685,7 @@ class MainWindow(QMainWindow):
         if result == QDialog.DialogCode.Accepted:
             self.reconnect()
         else:
-            self.notice.setText("已取消修改连接设置。")
+            self.set_notice("已取消修改连接设置。")
 
     def reconnect(self):
         if (
@@ -791,23 +693,23 @@ class MainWindow(QMainWindow):
             or self.account_actions
             or (self.login_dialog and self.login_dialog.isVisible())
         ):
-            self.notice.setText("请等待发送完成并关闭登录窗口后重新连接。")
+            self.set_notice("请等待发送完成并关闭登录窗口后重新连接。")
             return
-        self.notice.setText("正在重新连接…")
+        self.set_notice("正在重新连接…")
         self.bridge.submit("reconnect")
 
     def open_login(self):
         if self.account_actions:
-            self.notice.setText("请等待账号操作完成。")
+            self.set_notice("请等待账号操作完成。")
             return
         if self.mock:
-            self.notice.setText("模拟模式提供五个示例账号，不进行真实登录。")
+            self.set_notice("模拟模式提供五个示例账号，不进行真实登录。")
             return
         if not self.store.export_settings():
             self.open_connection_settings()
             return
         if self.pending_sends:
-            self.notice.setText("请等待发送结束后再登录。")
+            self.set_notice("请等待发送结束后再登录。")
             return
         if self.login_dialog and self.login_dialog.isVisible():
             self.login_dialog.raise_()
@@ -844,7 +746,7 @@ class MainWindow(QMainWindow):
             or self.account_actions
             or (self.login_dialog and self.login_dialog.isVisible())
         ):
-            self.notice.setText("请等待发送或账号操作完成，并关闭登录窗口。")
+            self.set_notice("请等待发送或账号操作完成，并关闭登录窗口。")
             return
         account = next((a for a in self.store.accounts() if a["id"] == aid), None)
         if not account:
@@ -870,19 +772,26 @@ class MainWindow(QMainWindow):
         self.save_view()
         self.account_actions.add(aid)
         self.bridge.submit(operation, account_id=aid)
-        self.notice.setText(f"正在{title}…")
+        self.set_notice(f"正在{title}…")
         self.refresh_counts()
 
     def clear_account_view(self, aid):
         self.statuses.pop(aid, None)
         self.groups_cache.pop(aid, None)
         self.group_requests.pop(aid, None)
-        for mapping in (self.buffers, self.scroll_positions, self.history_requests):
+        for mapping in (
+            self.buffers,
+            self.cache.history,
+            self.scroll_positions,
+            self.history_requests,
+            self.history_before,
+        ):
             for target in list(mapping):
                 if target[0] == aid:
                     mapping.pop(target)
         self.history_exhausted = {t for t in self.history_exhausted if t[0] != aid}
-        self.preview_requested = {t for t in self.preview_requested if t[0] != aid}
+        self.resume_bottom = {t for t in self.resume_bottom if t[0] != aid}
+        self.draft_dirty = {t for t in self.draft_dirty if t[0] != aid}
         if self.account_id == aid:
             # Do not save a removed account's draft while selecting the next account.
             self.account_id = None
@@ -894,6 +803,10 @@ class MainWindow(QMainWindow):
             self.render_messages()
 
     def refresh_phrases(self):
+        if not self.foreground:
+            self.phrases_dirty = True
+            return
+        self.phrases_dirty = False
         while self.phrase_layout.count():
             item = self.phrase_layout.takeAt(0)
             if item.widget():
@@ -943,6 +856,12 @@ class MainWindow(QMainWindow):
     def refresh_accounts(self):
         selected = self.account_id
         accounts = self.store.accounts()
+        self.account_records = {a["id"]: a for a in accounts}
+        self.counts_dirty = True
+        self.accounts_dirty = True
+        if not self.foreground:
+            return
+        self.accounts_dirty = False
         self.accounts.blockSignals(True)
         self.accounts.clear()
         for account in accounts:
@@ -978,6 +897,9 @@ class MainWindow(QMainWindow):
             self.group_requests[self.account_id] = request_id
 
     def render_groups(self):
+        if not self.foreground:
+            self.accounts_dirty = True
+            return
         selected = self.chat_id
         self.groups.blockSignals(True)
         self.groups.clear()
@@ -1017,6 +939,18 @@ class MainWindow(QMainWindow):
             return
         self.save_view()
         self.chat_id = chat_id
+        missing = self.target not in self.buffers
+        evicted = self.cache.open(self.target)
+        if evicted is not None:
+            self.scroll_positions.pop(evicted, None)
+            self.history_requests.pop(evicted, None)
+            self.history_before.pop(evicted, None)
+            self.history_exhausted.discard(evicted)
+            self.resume_bottom.discard(evicted)
+            self.draft_dirty.discard(evicted)
+        if missing:
+            self.set_notice("已加载最近消息，可继续加载更早消息。")
+        self.counts_dirty = True
         self.store.last_chat(self.account_id, chat_id)
         self.restore_draft()
         self.render_messages()
@@ -1036,12 +970,14 @@ class MainWindow(QMainWindow):
     def save_view(self):
         self.save_draft()
         if self.account_id and self.chat_id is not None:
-            bar = self.messages.verticalScrollBar()
             self.scroll_positions[self.target] = (
-                None if bar.value() >= bar.maximum() - 4 else bar.value()
+                self.messages.anchor() if self.target in self.cache.history else None
             )
 
     def save_draft(self):
+        if self.target in self.draft_dirty:
+            # A hidden failure has already restored the authoritative draft in SQLite.
+            return
         if not self.loading_draft and self.account_id and self.chat_id is not None:
             self.store.save_draft(
                 self.account_id,
@@ -1052,6 +988,7 @@ class MainWindow(QMainWindow):
             )
 
     def restore_draft(self):
+        self.draft_dirty.discard(self.target)
         self.loading_draft = True
         draft = self.store.draft(*self.target) if self.chat_id is not None else {}
         self.input.setPlainText(draft.get("text", ""))
@@ -1064,10 +1001,10 @@ class MainWindow(QMainWindow):
         self.refresh_counts()
 
     def quote(self, item):
-        message = self.buffers.get(self.target, {}).get(item.data(Qt.ItemDataRole.UserRole))
+        message = item.data(MESSAGE_ROLE)
         if message:
             self.reply_id = message.message_id
-            self.reply_text = f"{message.sender}：{message.text or '[' + message.media + ']'}"
+            self.reply_text = f"{message.sender}：{message.text or media_text(message.media)}"
             self.quote_label.setText("回复：" + self.reply_text[:100])
             self.save_draft()
             self.input.setFocus()
@@ -1078,8 +1015,8 @@ class MainWindow(QMainWindow):
         self.save_draft()
 
     def message_menu(self, pos):
-        item = self.messages.itemAt(pos)
-        if item:
+        item = self.messages.indexAt(pos)
+        if item.isValid():
             menu = QMenu(self)
             action = menu.addAction("引用回复")
             if menu.exec(self.messages.viewport().mapToGlobal(pos)) == action:
@@ -1090,119 +1027,183 @@ class MainWindow(QMainWindow):
             return
         if self.target in self.history_requests:
             return
-        buffer = self.buffers.get(self.target, {})
+        if older:
+            self.cache.browse(self.target)
+        buffer = self.cache.view(self.target)
         before = min(buffer) if older and buffer else 0
         request_id = self.bridge.submit(
             "history", account_id=self.account_id, chat_id=self.chat_id, before=before
         )
         self.history_requests[self.target] = request_id
+        self.history_before[self.target] = before
         self.refresh_counts()
+
+    @property
+    def foreground(self):
+        return self.isVisible() and not self.isMinimized() and not self.closing
 
     def put_message(self, message):
         target = message.account_id, message.chat_id
-        buffer = self.buffers.setdefault(target, {})
-        existing = buffer.get(message.message_id)
-        if existing and existing.preview_path:
-            message = replace(message, preview_path=existing.preview_path)
-        buffer[message.message_id] = message
+        self.cache.put(message)
         return target
 
     def render_messages(self, keep_scroll=False):
+        if not self.foreground:
+            self.ui_dirty = True
+            return
+        anchor = self.messages.anchor() if keep_scroll else self.scroll_positions.get(self.target)
         self.rendering = True
-        bar = self.messages.verticalScrollBar()
-        old_value = bar.value()
-        old_max = bar.maximum()
-        stick_bottom = old_value >= old_max - 4
-        self.messages.clear()
-        self.items.clear()
-        for message in sorted(
-            self.buffers.get(self.target, {}).values(), key=lambda m: m.message_id
-        ):
-            item = QListWidgetItem()
-            item.setData(Qt.ItemDataRole.UserRole, message.message_id)
-            self.messages.addItem(item)
-            self.items[message.message_id] = item
-            self.render_message(item, message)
-        if keep_scroll:
-            if stick_bottom:
-                self.messages.scrollToBottom()
-            else:
-                bar.setValue(old_value + max(0, bar.maximum() - old_max))
-        elif self.scroll_positions.get(self.target) is None:
-            self.messages.scrollToBottom()
-        else:
-            bar.setValue(self.scroll_positions[self.target])
+        self.message_sync_timer.stop()
+        view = self.cache.view(self.target)
+        self.messages.model().sync(self.target, view)
+        self.messages.itemDelegate().prune(view.values())
+        self.messages.doItemsLayout()
+        self.messages.restore_anchor(anchor)
+        if self.resize_pending:
+            self.resize_anchor = anchor
         self.rendering = False
-        self.preview_timer.start(100)
+        self.ui_dirty = False
 
-    def render_message(self, item, message):
-        widget = MessageRow(message)
-        self.messages.setItemWidget(item, widget)
-        item.setSizeHint(widget.fit(self.messages.viewport().width()))
+    def schedule_message_resize(self):
+        if self.foreground:
+            self.rendering = self.resize_rendering_state
+            self.message_resize_timer.start(0)
+
+    def prepare_message_resize(self):
+        if not self.foreground:
+            return
+        if not self.resize_pending:
+            bar = self.messages.verticalScrollBar()
+            self.resize_anchor = self.messages.anchor() if bar.value() < bar.maximum() - 4 else None
+        self.resize_pending = True
+        # Geometry-driven scrollbar changes are not a manual history browse.
+        self.resize_rendering_state = self.rendering
+        self.rendering = True
 
     def resize_messages(self):
-        if self.closing:
+        if not self.foreground:
             return
         bar = self.messages.verticalScrollBar()
-        old_value = bar.value()
-        at_bottom = old_value >= bar.maximum() - 4
+        anchor = (
+            self.resize_anchor
+            if self.resize_pending
+            else (self.messages.anchor() if bar.value() < bar.maximum() - 4 else None)
+        )
         self.rendering = True
-        for item in self.items.values():
-            widget = self.messages.itemWidget(item)
-            item.setSizeHint(widget.fit(self.messages.viewport().width()))
+        self.messages.itemDelegate().layouts.clear()
         self.messages.doItemsLayout()
-        if at_bottom:
-            self.messages.scrollToBottom()
-        else:
-            bar.setValue(old_value)
+        self.messages.restore_anchor(anchor)
+        self.resize_pending = False
         self.rendering = False
-        self.preview_timer.start(100)
 
     def scrolled(self):
-        if not self.closing and not self.rendering:
-            self.preview_timer.start(100)
-
-    def visible_previews(self):
-        if self.closing:
+        if not self.foreground or self.rendering:
             return
-        viewport = self.messages.viewport().rect()
-        for mid, item in self.items.items():
-            message = self.buffers.get(self.target, {}).get(mid)
-            key = (*self.target, mid)
-            if (
-                message
-                and message.media in {"photo", "sticker"}
-                and not message.preview_path
-                and key not in self.preview_requested
-                and self.messages.visualItemRect(item).intersects(viewport)
-            ):
-                self.preview_requested.add(key)
-                self.bridge.submit(
-                    "preview", account_id=self.account_id, chat_id=self.chat_id, message_id=mid
-                )
+        bar = self.messages.verticalScrollBar()
+        if bar.value() < bar.maximum() - 4:
+            self.cache.browse(self.target)
+            self.scroll_positions[self.target] = self.messages.anchor()
+        if self.resize_pending:
+            self.resize_anchor = self.messages.anchor() if bar.value() < bar.maximum() - 4 else None
 
-    def go_bottom(self):
-        self.messages.scrollToBottom()
+    def go_bottom(self, refresh=True):
+        if self.history_before.get(self.target):
+            self.history_requests.pop(self.target, None)
+            self.history_before.pop(self.target, None)
+        self.cache.bottom(self.target)
+        self.scroll_positions[self.target] = None
+        if not self.foreground:
+            self.resume_bottom.add(self.target)
+            self.ui_dirty = True
+            return
+        self.render_messages()
         self.bottom.setText("回到底部")
+        self.history_exhausted.discard(self.target)
+        if refresh:
+            self.load_history()
+
+    def pause_view(self):
+        if not self.closing:
+            self.save_view()
+        if hasattr(self, "timer"):
+            self.timer.stop()
+        self.message_resize_timer.stop()
+        self.message_sync_timer.stop()
+        self.resize_pending = False
+        self.messages.setUpdatesEnabled(False)
+
+    def resume_view(self):
+        if not self.foreground:
+            return
+        self.messages.setUpdatesEnabled(True)
+        if self.accounts_dirty:
+            self.refresh_accounts()
+            self.render_groups()
+        if self.phrases_dirty:
+            self.refresh_phrases()
+        if self.target in self.resume_bottom:
+            self.resume_bottom.discard(self.target)
+            self.cache.bottom(self.target)
+            self.scroll_positions[self.target] = None
+        had_updates = self.ui_dirty
+        self.render_messages()
+        if self.target in self.draft_dirty:
+            self.restore_draft()
+        if self.notice_text is not None:
+            self.notice.setText(self.notice_text)
+        if self.target in self.cache.history:
+            self.bottom.setText("有新消息 · 回到底部" if had_updates else "回到底部")
+        self.refresh_counts()
+
+    def set_notice(self, text):
+        self.notice_text = text
+        if self.foreground:
+            self.notice.setText(text)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.resume_view()
+
+    def hideEvent(self, event):
+        self.pause_view()
+        super().hideEvent(event)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            if self.isMinimized():
+                self.pause_view()
+            else:
+                self.resume_view()
+
+    def schedule_midnight(self):
+        now = datetime.now(BEIJING)
+        tomorrow = datetime(now.year, now.month, now.day, tzinfo=BEIJING) + timedelta(days=1)
+        self.day_timer.start(max(1, int((tomorrow - now).total_seconds() * 1000) + 100))
+
+    def day_changed(self):
+        self.counts_dirty = True
+        self.refresh_counts()
+        self.schedule_midnight()
 
     def send_text(self, text, source):
         if self.account_actions or self.statuses.get(self.account_id) not in {"已连接", "模拟连接"}:
-            self.notice.setText("账号未连接或正在管理账号，请连接并登录后再发送。")
+            self.set_notice("账号未连接或正在管理账号，请连接并登录后再发送。")
             return
         if not self.account_id or self.chat_id is None:
-            self.notice.setText("请先选择账号和群。")
+            self.set_notice("请先选择账号和群。")
             return
         deadline = max(
             self.blocked.get(self.target, 0), self.blocked_accounts.get(self.account_id, 0)
         )
         if self.target in self.pending_sends:
-            self.notice.setText("上一条仍在发送，当前草稿已保留；发送结束后请再按 Enter。")
+            self.set_notice("上一条仍在发送，当前草稿已保留；发送结束后请再按 Enter。")
             return
         if deadline > time.monotonic():
-            self.notice.setText("Telegram 等待时间尚未结束，当前草稿已保留。")
+            self.set_notice("Telegram 等待时间尚未结束，当前草稿已保留。")
             return
         if not text.strip() or len(text) > 4096:
-            self.notice.setText("消息须为 1–4096 个字符。")
+            self.set_notice("消息须为 1–4096 个字符。")
             return
         self.save_draft()
         request = SendRequest(uuid4().hex, self.account_id, self.chat_id, text, self.reply_id)
@@ -1213,11 +1214,27 @@ class MainWindow(QMainWindow):
             self.quote_label.setText("双击消息引用回复")
             self.input.clear()
             self.save_draft()
-        self.notice.setText("正在发送；账号和目标群已固定。")
+        self.set_notice("正在发送；账号和目标群已固定。")
         self.refresh_counts()
 
     def refresh_counts(self):
-        accounts = {a["id"]: a for a in self.store.accounts()}
+        if not self.foreground:
+            self.ui_dirty = True
+            if hasattr(self, "timer"):
+                self.timer.stop()
+            return
+        if self.count_day != day_key():
+            self.counts_dirty = True
+        if self.counts_dirty:
+            self.count_day = day_key()
+            self.counts_snapshot = self.store.counts_for_accounts(
+                self.account_records, self.count_day
+            )
+            self.counts_dirty = False
+        accounts = self.account_records
+        totals = {}
+        for (aid, _), total in self.counts_snapshot.items():
+            totals[aid] = totals.get(aid, 0) + total
         for i in range(self.accounts.count()):
             item = self.accounts.item(i)
             aid = item.data(Qt.ItemDataRole.UserRole)
@@ -1226,14 +1243,20 @@ class MainWindow(QMainWindow):
                 continue
             shortcut = f"Alt+{i + 1} · " if i < 9 else ""
             item.setText(
-                f"{shortcut}{account['label']} · {self.store.count(aid)} 条\n"
+                f"{shortcut}{account['label']} · {totals.get(aid, 0)} 条\n"
                 f"{self.statuses.get(aid, '未连接')}"
             )
         valid = bool(self.account_id and self.chat_id is not None)
         deadline = max(
             self.blocked.get(self.target, 0), self.blocked_accounts.get(self.account_id, 0)
         )
-        wait = max(0, int(deadline - time.monotonic()) + 1)
+        wait = max(0, ceil(deadline - time.monotonic()))
+        if hasattr(self, "timer"):
+            if wait:
+                if not self.timer.isActive():
+                    self.timer.start(1000)
+            else:
+                self.timer.stop()
         busy = self.target in self.pending_sends
         online = self.statuses.get(self.account_id) in {"已连接", "模拟连接"}
         self.send_button.setEnabled(
@@ -1255,7 +1278,7 @@ class MainWindow(QMainWindow):
             "未选群",
         )
         label = accounts.get(self.account_id, {}).get("label", "未选账号")
-        count = self.store.count(*self.target) if valid else 0
+        count = self.counts_snapshot.get(self.target, 0) if valid else 0
         self.identity.setText(
             f"当前账号：{label}　→　{group}　|　本群今日工具发送：{count} 条"
             + (f"　等待 {wait} 秒" if wait else "")
@@ -1275,37 +1298,44 @@ class MainWindow(QMainWindow):
                 if operation == "logout":
                     self.statuses[aid] = "需要登录"
                 self.refresh_accounts()
-                self.notice.setText(
+                self.set_notice(
                     "账号已移除。"
                     if operation == "remove_account"
                     else "已退出登录，草稿和统计已保留。"
                 )
             else:
-                self.notice.setText(event["message"])
+                self.set_notice(event["message"])
             self.refresh_counts()
             return
-        if aid and not any(a["id"] == aid for a in self.store.accounts()):
+        if aid and aid not in self.account_records and kind != "status":
             return
         if kind == "status":
+            if aid not in self.account_records:
+                self.refresh_accounts()
+                if aid not in self.account_records:
+                    return
             self.statuses[event["account_id"]] = event["status"]
             self.refresh_counts()
             return
         if kind == "message":
             message = event["message"]
             if (
-                not any(a["id"] == message.account_id for a in self.store.accounts())
+                message.account_id not in self.account_records
                 or message.account_id in self.account_actions
             ):
                 return
             target = self.put_message(message)
             if target == self.target:
-                bar = self.messages.verticalScrollBar()
-                at_bottom = bar.value() >= bar.maximum() - 4
-                self.append_visible(message)
-                if at_bottom:
-                    self.messages.scrollToBottom()
+                if target not in self.cache.history:
+                    if self.foreground:
+                        if not self.message_sync_timer.isActive():
+                            self.message_sync_timer.start(16)
+                    else:
+                        self.ui_dirty = True
                 else:
-                    self.bottom.setText("有新消息 · 回到底部")
+                    if self.foreground:
+                        self.bottom.setText("有新消息 · 回到底部")
+                    self.ui_dirty = True
             return
         if (
             self.login_dialog
@@ -1322,15 +1352,15 @@ class MainWindow(QMainWindow):
                 return
             self.pending_sends.pop(target, None)
             if kind == "result":
+                self.counts_dirty = True
                 if pending and pending[1] != "input":
                     self.store.complete_draft(request, pending[1])
                 self.put_message(event["result"])
                 if target == self.target:
                     if pending and pending[1] != "input":
                         self.restore_draft()
-                    self.append_visible(event["result"])
-                    self.go_bottom()
-                self.notice.setText("发送成功。")
+                    self.go_bottom(refresh=False)
+                self.set_notice("发送成功。")
             else:
                 if pending and pending[1] == "input":
                     draft = self.store.draft(*target)
@@ -1345,16 +1375,18 @@ class MainWindow(QMainWindow):
                         if draft["text"] or draft["reply_id"] is not None
                         else pending[2],
                     )
-                    if target == self.target:
+                    if target == self.target and self.foreground:
                         self.restore_draft()
+                    elif target == self.target:
+                        self.draft_dirty.add(target)
                 if event.get("wait"):
                     if event.get("wait_scope") == "account":
                         self.blocked_accounts[request.account_id] = time.monotonic() + event["wait"]
                     else:
                         self.blocked[target] = time.monotonic() + event["wait"]
-                self.notice.setText(event["message"])
+                self.set_notice(event["message"])
                 if pending and pending[1] == "input":
-                    self.notice.setText(
+                    self.set_notice(
                         event["message"] + "；原文本已恢复到该聊天草稿开头，请核对后手动发送。"
                     )
         elif operation == "groups":
@@ -1366,54 +1398,39 @@ class MainWindow(QMainWindow):
                 if aid == self.account_id:
                     self.render_groups()
             else:
-                self.notice.setText(event["message"])
+                self.set_notice(event["message"])
         elif operation == "history":
             target = event["account_id"], event["chat_id"]
             if self.history_requests.get(target) != event["request_id"]:
                 return
             self.history_requests.pop(target, None)
+            self.history_before.pop(target, None)
             if kind == "result":
                 if not event["result"]:
                     self.history_exhausted.add(target)
-                for message in event["result"]:
-                    self.put_message(message)
+                if event.get("before"):
+                    self.cache.older(target, event["result"])
+                else:
+                    for message in event["result"]:
+                        self.put_message(message)
                 if target == self.target:
                     self.render_messages(keep_scroll=bool(event.get("before")))
             else:
-                self.notice.setText(event["message"])
-        elif operation == "preview":
-            target = event["account_id"], event["chat_id"]
-            mid = event["message_id"]
-            message = self.buffers.get(target, {}).get(mid)
-            if kind == "result" and event["result"] and message:
-                updated = replace(message, preview_path=event["result"])
-                self.buffers[target][mid] = updated
-                if target == self.target and mid in self.items:
-                    self.render_message(self.items[mid], updated)
-                    self.preview_timer.start(100)
+                self.set_notice(event["message"])
         elif operation in {"start", "reconnect"}:
             self.refresh_accounts()
             self.load_groups()
+            if operation == "start" and kind == "result":
+                self.refresh_phrases()
             if kind == "result":
-                self.notice.setText(
+                self.set_notice(
                     "模拟服务已启动。" if self.mock else "连接检查完成，请查看各账号状态。"
                 )
             else:
-                self.notice.setText(event["message"])
+                self.set_notice(event["message"])
         elif kind == "error":
-            self.notice.setText(event["message"])
+            self.set_notice(event["message"])
         self.refresh_counts()
-
-    def append_visible(self, message):
-        if message.message_id not in self.items:
-            item = QListWidgetItem()
-            item.setData(Qt.ItemDataRole.UserRole, message.message_id)
-            self.messages.addItem(item)
-            self.items[message.message_id] = item
-        self.render_message(
-            self.items[message.message_id], self.buffers[self.target][message.message_id]
-        )
-        self.preview_timer.start(100)
 
     def setup_tray(self):
         # Draw the icon locally so frozen builds need no external image resources.
@@ -1495,8 +1512,9 @@ class MainWindow(QMainWindow):
             dialog.hide()
         self.hidden_dialogs.clear()
         self.timer.stop()
-        self.preview_timer.stop()
+        self.day_timer.stop()
         self.message_resize_timer.stop()
+        self.message_sync_timer.stop()
         self.bridge.event.disconnect(self.handle)
         QApplication.instance().removeEventFilter(self.shortcut_filter)
         if self.tray:

@@ -12,6 +12,10 @@ from tg_chat_client.app import report_ui_exception
 
 @pytest.mark.parametrize("exit_mode", ["smoke", "external"])
 def test_application_exits_with_tray_and_releases_instance_lock(tmp_path, exit_mode):
+    cache = tmp_path / "mock" / "cache"
+    cache.mkdir(parents=True)
+    old_preview = cache / "legacy-preview.png"
+    old_preview.write_bytes(b"legacy-cache-do-not-read-or-delete")
     script = """
 import sys
 from PySide6.QtCore import QTimer
@@ -45,6 +49,7 @@ assert windows[0].closing and windows[0].bridge.closed
             timeout=15,
         )
         assert result.returncode == 0, result.stderr
+        assert old_preview.read_bytes() == b"legacy-cache-do-not-read-or-delete"
 
 
 def test_button_callback_failure_is_visible_without_logging_private_values(

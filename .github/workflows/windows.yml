@@ -42,10 +42,13 @@ jobs:
         run: |
           Copy-Item packaging/使用说明.txt dist/TGChatClient/使用说明.txt
           Compress-Archive -Path dist/TGChatClient -DestinationPath dist/TGChatClient-windows-x64.zip
+      - name: Measure offline five-account workload
+        run: uv run --no-sync python scripts/benchmark.py --output dist/performance-after.json --package dist/TGChatClient-windows-x64.zip
       - uses: actions/upload-artifact@v4
         with:
           name: TGChatClient-windows-x64
           path: |
             dist/TGChatClient-windows-x64.zip
+            dist/performance-after.json
             uv.lock
           retention-days: 14

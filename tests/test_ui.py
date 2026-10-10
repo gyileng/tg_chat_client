@@ -13,33 +13,18 @@ from tg_chat_client.store import Store
 from tg_chat_client.ui import Composer, MainWindow
 
 
-@pytest.fixture(autouse=True)
-def no_desktop_tray(monkeypatch):
-    # Keep all existing tests independent of the host desktop (including Windows CI).
-    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", lambda: False)
-
-
-@pytest.fixture
-def tray_window(window, monkeypatch):
-    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", lambda: True)
-    monkeypatch.setattr(QSystemTrayIcon, "show", lambda self: None)
-    window.setup_tray()
-    window.store.set_setting("tray_hint_seen", True)
-    return window
-
-
 def test_tray_close_preserves_draft_quote_and_live_service(tray_window, qtbot):
     window = tray_window
     target = window.target
     window.input.setPlainText("托盘草稿")
-    window.quote(window.messages.item(0))
+    window.quote(window.messages.model().index(0))
     reply = window.reply_id
     bar = window.messages.verticalScrollBar()
     bar.setValue(0)
     window.close()
     assert not window.isVisible()
     assert not window.closing and not window.bridge.closed
-    assert window.timer.isActive()
+    assert not window.timer.isActive()
     assert window.store.draft(*target)["text"] == "托盘草稿"
     assert window.store.draft(*target)["reply_id"] == reply
     window.tray.activated.emit(QSystemTrayIcon.ActivationReason.Trigger)
@@ -135,7 +120,6 @@ def test_tray_exit_cleans_up_once(tray_window, monkeypatch):
     window.request_exit()
     assert window.closing and window.bridge.closed
     assert not window.timer.isActive()
-    assert not window.preview_timer.isActive()
     assert not window.message_resize_timer.isActive()
     assert not window.tray.isVisible()
     assert calls == ["close"]
@@ -337,7 +321,7 @@ def test_remove_current_and_last_account_clears_view(window, qtbot, monkeypatch)
     assert window.account_id is None
     assert window.chat_id is None
     assert window.accounts.count() == 0
-    assert window.messages.count() == 0
+    assert window.messages.model().rowCount() == 0
     assert window.input.toPlainText() == ""
     assert not window.send_button.isEnabled()
 
@@ -379,28 +363,16 @@ def test_failed_remove_resets_controls_and_preserves_view(window):
     assert window.notice.text() == "退出失败"
 
 
-@pytest.fixture
-def window(qtbot, tmp_path):
-    store = Store(tmp_path)
-    bridge = ServiceBridge(store, mock=True)
-    window = MainWindow(store, bridge, mock=True)
-    qtbot.addWidget(window)
-    window.show()
-    window.activateWindow()
-    qtbot.waitUntil(lambda: window.accounts.count() == 5 and window.messages.count() >= 30)
-    yield window
-    window.request_exit()
-
-
-def test_startup_with_saved_account_initializes_preview_timer(qtbot, tmp_path):
+def test_startup_with_saved_account_initializes_message_model(qtbot, tmp_path):
     store = Store(tmp_path)
     store.add_account("saved-account", "已保存账号", "")
     bridge = ServiceBridge(store, mock=True)
     window = MainWindow(store, bridge, mock=True)
     qtbot.addWidget(window)
     try:
+        window.show()
         assert window.account_id == "saved-account"
-        assert window.preview_timer.isActive()
+        assert window.messages.model().rowCount() == 0
     finally:
         qtbot.waitUntil(lambda: window.statuses.get("saved-account") == "模拟连接")
         window.request_exit()
@@ -457,7 +429,7 @@ def test_close_before_deferred_start_does_not_submit(qtbot, tmp_path, monkeypatc
 def test_switch_restores_draft_and_quote(window, qtbot):
     first = window.account_id
     window.input.setPlainText("账号一草稿")
-    window.quote(window.messages.item(0))
+    window.quote(window.messages.model().index(0))
     reply_id = window.reply_id
     window.accounts.setCurrentRow(1)
     qtbot.waitUntil(lambda: window.chat_id is not None)
@@ -473,7 +445,7 @@ def test_send_during_switch_preserves_new_edits_and_other_account_draft(window, 
     chat = window.chat_id
     window.input.clear()
     window.insert_phrase("快捷短句")
-    window.quote(window.messages.item(0))
+    window.quote(window.messages.model().index(0))
     window.send_text(window.input.toPlainText(), "input")
     window.input.setPlainText("保留的自由输入")
     window.accounts.setCurrentRow(1)
@@ -523,7 +495,7 @@ def test_submit_clears_immediately_and_success_preserves_identical_next_draft(
 ):
     calls = []
     monkeypatch.setattr(window.bridge, "submit", lambda operation, **args: calls.append(args))
-    window.quote(window.messages.item(0))
+    window.quote(window.messages.model().index(0))
     reply_id = window.reply_id
     window.input.setPlainText("重复短句")
     qtbot.keyClick(window.input, Qt.Key.Key_Return)
@@ -534,7 +506,7 @@ def test_submit_clears_immediately_and_success_preserves_identical_next_draft(
     assert window.reply_id is None
 
     window.input.setPlainText("重复短句")
-    window.quote(window.messages.item(0))
+    window.quote(window.messages.model().index(0))
     qtbot.keyClick(window.input, Qt.Key.Key_Return)
     assert len(calls) == 1
     assert "上一条仍在发送" in window.notice.text()
@@ -571,7 +543,7 @@ def test_send_failure_restores_text_without_losing_next_draft(
 
     monkeypatch.setattr(window.bridge, "submit", submit)
     target = window.target
-    window.quote(window.messages.item(0))
+    window.quote(window.messages.model().index(0))
     reply_id, reply_text = window.reply_id, window.reply_text
     window.input.setPlainText("未成功文本")
     qtbot.keyClick(window.input, Qt.Key.Key_Return)
@@ -612,8 +584,8 @@ def test_successful_send_returns_to_bottom(window, qtbot, browse_history):
     qtbot.waitUntil(lambda: window.store.count(*window.target) == 1 and not window.pending_sends)
     qtbot.waitUntil(lambda: bar.value() == bar.maximum())
     assert window.bottom.text() == "回到底部"
-    last = window.messages.item(window.messages.count() - 1)
-    assert window.messages.visualItemRect(last).intersects(window.messages.viewport().rect())
+    last = window.messages.model().index(window.messages.model().rowCount() - 1)
+    assert window.messages.visualRect(last).intersects(window.messages.viewport().rect())
 
 
 def test_incoming_message_preserves_history_scroll(window, qtbot):
@@ -639,7 +611,7 @@ def test_other_account_send_result_preserves_scroll(window, qtbot):
     qtbot.waitUntil(
         lambda: (
             window.chat_id is not None
-            and window.messages.count() >= 30
+            and window.messages.model().rowCount() >= 30
             and window.target not in window.history_requests
         )
     )
@@ -649,15 +621,13 @@ def test_other_account_send_result_preserves_scroll(window, qtbot):
     assert bar.value() == 0
 
 
-def test_preview_fixture_is_displayable(window, qtbot):
-    from PySide6.QtGui import QPixmap
-    from PySide6.QtWidgets import QAbstractItemView
-
-    window.messages.scrollToItem(
-        window.messages.item(4), QAbstractItemView.ScrollHint.PositionAtCenter
-    )
-    qtbot.waitUntil(lambda: bool(list((window.store.root / "cache").glob("*.png"))))
-    assert not QPixmap(str(window.store.root / "cache" / "mock.png")).isNull()
+def test_media_is_placeholder_and_never_creates_preview(window, qtbot):
+    index = window.messages.model().index(4)
+    window.messages.scrollTo(index)
+    qtbot.wait(20)
+    assert "[图片]" in index.data()
+    assert "加载中" not in index.data()
+    assert list((window.store.root / "cache").iterdir()) == []
 
 
 def test_shortcuts_do_not_fire_in_dialog(window, qtbot):
@@ -685,7 +655,7 @@ def test_phrase_inserts_at_cursor_without_sending(window, qtbot, draft, start, e
     window.store.replace_phrases(["短句"])
     window.refresh_phrases()
     window.input.setPlainText(draft)
-    window.quote(window.messages.item(0))
+    window.quote(window.messages.model().index(0))
     reply_id = window.reply_id
     cursor = window.input.textCursor()
     cursor.setPosition(start)
@@ -815,7 +785,7 @@ def test_alias_expansion_preserves_draft_and_quote(
     )
     window.refresh_phrases()
     window.input.setPlainText(draft)
-    window.quote(window.messages.item(0))
+    window.quote(window.messages.model().index(0))
     reply = window.reply_id
     cursor = window.input.textCursor()
     cursor.setPosition(position)
@@ -879,7 +849,7 @@ def test_ime_committed_alias_expands_and_preserves_quote(window, qtbot, prefix, 
     cursor = window.input.textCursor()
     cursor.setPosition(len(f"😀前{prefix}".encode("utf-16-le")) // 2)
     window.input.setTextCursor(cursor)
-    window.quote(window.messages.item(0))
+    window.quote(window.messages.model().index(0))
     reply = window.reply_id
     window.input.inputMethodEvent(QInputMethodEvent("n", []))
     event = QInputMethodEvent("", [])
@@ -901,7 +871,7 @@ def test_ime_candidate_alias_expands_immediately(window, qtbot, prefix, preedit)
     cursor = window.input.textCursor()
     cursor.setPosition(len(f"😀前{prefix}".encode("utf-16-le")) // 2)
     window.input.setTextCursor(cursor)
-    window.quote(window.messages.item(0))
+    window.quote(window.messages.model().index(0))
     reply = window.reply_id
     window.input.inputMethodEvent(QInputMethodEvent("n", []))
     assert window.input.composing
@@ -1201,7 +1171,6 @@ def test_message_bubbles_align_and_quote_from_bubble_and_blank_space(window, qtb
     from PySide6.QtCore import QPoint
 
     from tg_chat_client.models import ChatMessage
-    from tg_chat_client.ui import MessageRow
 
     aid, chat = window.target
     for mid, outgoing in ((9001, False), (9002, True)):
@@ -1212,23 +1181,23 @@ def test_message_bubbles_align_and_quote_from_bubble_and_blank_space(window, qtb
         )
     window.render_messages()
     qtbot.wait(50)
-    incoming = window.messages.itemWidget(window.items[9001])
-    outgoing = window.messages.itemWidget(window.items[9002])
-    assert isinstance(outgoing, MessageRow)
-    assert incoming.name.text() == "<b>同名</b>"
-    assert outgoing.name.text() == "<b>同名</b>（我）"
-    assert incoming.name.textFormat() == Qt.TextFormat.PlainText
-    assert incoming.name.palette().color(
-        incoming.name.foregroundRole()
-    ) == outgoing.name.palette().color(outgoing.name.foregroundRole())
-    assert incoming.bubble.x() == 8
-    assert outgoing.bubble.geometry().right() >= outgoing.width() - 10
-    assert outgoing.bubble.width() < outgoing.width() * 0.75
-    item = window.items[9002]
-    window.messages.scrollToItem(item)
+    from tg_chat_client.message_view import MESSAGE_ROLE
+
+    incoming = window.messages.model().index_for(9001)
+    outgoing = window.messages.model().index_for(9002)
+    delegate = window.messages.itemDelegate()
+    incoming_doc, _ = delegate.layout(incoming.data(MESSAGE_ROLE), window.messages.font())
+    outgoing_doc, size = delegate.layout(outgoing.data(MESSAGE_ROLE), window.messages.font())
+    assert "<b>同名</b>" in incoming_doc.toPlainText()
+    assert "<b>同名</b>（我）" in outgoing_doc.toPlainText()
+    assert delegate.bubble_rect(incoming).left() == 8
+    assert size.width() < window.messages.viewport().width() * 0.75
+    item = outgoing
+    window.messages.scrollTo(item)
     qtbot.wait(30)
-    rect = window.messages.visualItemRect(item)
-    bubble_point = rect.topLeft() + outgoing.bubble.geometry().center()
+    rect = window.messages.visualRect(item)
+    assert delegate.bubble_rect(item).right() >= window.messages.viewport().width() - 10
+    bubble_point = delegate.bubble_rect(item).center().toPoint()
     qtbot.mouseClick(window.messages.viewport(), Qt.MouseButton.LeftButton, pos=bubble_point)
     qtbot.mouseDClick(window.messages.viewport(), Qt.MouseButton.LeftButton, pos=bubble_point)
     assert window.reply_id == 9002
@@ -1250,18 +1219,21 @@ def test_message_context_menu_quotes_right_bubble(window, qtbot):
     from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QMenu
 
+    from tg_chat_client.message_view import MESSAGE_ROLE
+
+    model = window.messages.model()
     outgoing_item = next(
-        item
-        for item in window.items.values()
-        if window.buffers[window.target][item.data(Qt.ItemDataRole.UserRole)].outgoing
+        model.index(row)
+        for row in range(model.rowCount())
+        if model.index(row).data(MESSAGE_ROLE).outgoing
     )
-    window.messages.scrollToItem(outgoing_item)
+    window.messages.scrollTo(outgoing_item)
     qtbot.wait(30)
-    row = window.messages.itemWidget(outgoing_item)
-    pos = window.messages.visualItemRect(outgoing_item).topLeft() + row.bubble.geometry().center()
+    pos = window.messages.itemDelegate().bubble_rect(outgoing_item).center().toPoint()
 
     def choose_reply():
-        menu = window.findChild(QMenu)
+        menu = QApplication.activePopupWidget()
+        assert isinstance(menu, QMenu)
         menu.setActiveAction(menu.actions()[0])
         qtbot.keyClick(menu, Qt.Key.Key_Return)
 
@@ -1270,41 +1242,25 @@ def test_message_context_menu_quotes_right_bubble(window, qtbot):
     assert window.reply_id == outgoing_item.data(Qt.ItemDataRole.UserRole)
 
 
-def test_message_resize_wraps_text_and_scales_preview(window, qtbot, tmp_path):
-    from PySide6.QtGui import QPixmap
-    from PySide6.QtWidgets import QLabel
-
+def test_message_resize_wraps_text_and_preserves_scroll(window, qtbot):
     from tg_chat_client.models import ChatMessage
 
-    path = tmp_path / "preview.png"
-    image = QPixmap(800, 600)
-    image.fill(Qt.GlobalColor.blue)
-    image.save(str(path))
     aid, chat = window.target
     message = ChatMessage(
-        aid,
-        chat,
-        9003,
-        "长昵称" * 30,
-        "长正文" * 200,
-        "12:00",
-        media="photo",
-        preview_path=str(path),
-        sender_id=9,
+        aid, chat, 9003, "长昵称" * 30, "长正文" * 200, "12:00", media="photo", sender_id=9
     )
     window.put_message(message)
     window.render_messages()
     qtbot.wait(50)
-    row = window.messages.itemWidget(window.items[9003])
-    wide_width, wide_height = row.bubble.width(), row.bubble.height()
+    delegate = window.messages.itemDelegate()
+    _, wide = delegate.layout(message, window.messages.font())
     window.resize(850, 650)
     qtbot.wait(50)
-    row = window.messages.itemWidget(window.items[9003])
-    assert row.bubble.width() < wide_width
-    assert row.bubble.width() <= (window.messages.viewport().width() - 16) * 0.75
-    assert row.bubble.height() > wide_height
-    assert row.media.pixmap().width() <= row.bubble.width() - 20
-    assert row.findChild(QLabel, "messageText").wordWrap()
+    doc, narrow = delegate.layout(message, window.messages.font())
+    assert narrow.width() < wide.width()
+    assert narrow.width() <= (window.messages.viewport().width() - 16) * 0.75
+    assert narrow.height() > wide.height()
+    assert "[图片]" in doc.toPlainText()
     assert window.messages.horizontalScrollBar().maximum() == 0
     window.messages.verticalScrollBar().setValue(0)
     window.resize(1000, 700)
@@ -1318,7 +1274,7 @@ def test_message_resize_wraps_text_and_scales_preview(window, qtbot, tmp_path):
 
 
 def test_sender_color_is_stable_with_missing_identity():
-    from tg_chat_client.ui import sender_color
+    from tg_chat_client.message_view import sender_color
 
     assert sender_color(None) == "#666666"
     assert sender_color(42) == sender_color(42)

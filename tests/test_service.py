@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from telethon.errors import FloodWaitError, PhoneMigrateError, SlowModeWaitError
 
 from tg_chat_client.models import ChatMessage, SendRequest
-from tg_chat_client.service import MockService, ServiceRuntime, TelegramService, prune_cache
+from tg_chat_client.service import MockService, ServiceRuntime, TelegramService
 from tg_chat_client.store import Store
 
 
@@ -194,11 +194,11 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.store.accounts()), 1)
         self.assertEqual(self.store.draft("a", -1)["text"], "保留")
 
-    async def test_remove_cancels_preview_before_cleanup_and_blocks_new_sends(self):
+    async def test_remove_cancels_history_before_cleanup_and_blocks_new_sends(self):
         entered = asyncio.Event()
         release = asyncio.Event()
 
-        async def preview(account_id):
+        async def history(account_id):
             entered.set()
             await asyncio.Event().wait()
 
@@ -207,10 +207,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             entered.set()
             await release.wait()
 
-        self.service.preview = preview
+        self.service.history = history
         self.service.remove_account = remove_account
-        preview_task = asyncio.create_task(
-            self.runtime.execute("preview", "p", {"account_id": "a"})
+        history_task = asyncio.create_task(
+            self.runtime.execute("history", "p", {"account_id": "a"})
         )
         await entered.wait()
         entered.clear()
@@ -223,7 +223,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.service.calls)
         release.set()
         await remove_task
-        self.assertTrue(preview_task.cancelled())
+        self.assertTrue(history_task.cancelled())
 
     async def test_mock_logout_and_remove_survive_restart(self):
         mock = MockService(self.store, self.events.append)
@@ -360,25 +360,3 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.send(self.request("other", chat=-2))
         self.assertEqual(len(self.service.calls), 2)
         self.assertEqual(self.store.count("a", -2), 1)
-
-    async def test_mock_preview_has_valid_png_chunks(self):
-        import struct
-        import zlib
-
-        mock = MockService(self.store, self.events.append)
-        data = Path(await mock.preview("mock-1", -1001, 5)).read_bytes()
-        self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
-        offset = 8
-        while offset < len(data):
-            size = struct.unpack(">I", data[offset : offset + 4])[0]
-            payload = data[offset + 4 : offset + 8 + size]
-            checksum = struct.unpack(">I", data[offset + 8 + size : offset + 12 + size])[0]
-            self.assertEqual(checksum, zlib.crc32(payload))
-            offset += 12 + size
-
-    async def test_cache_prunes_oldest_files_to_budget(self):
-        folder = self.store.root / "cache"
-        (folder / "a").write_bytes(b"a" * 10)
-        (folder / "b").write_bytes(b"b" * 10)
-        prune_cache(self.store.root, max_bytes=10)
-        self.assertLessEqual(sum(p.stat().st_size for p in folder.iterdir()), 10)

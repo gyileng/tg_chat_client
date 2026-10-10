@@ -47,6 +47,13 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.count("a", -1, "2026-10-09"), 1)
         self.assertEqual(self.store.count("b", day="2026-10-09"), 1)
         self.assertEqual(self.store.count("a", -1, "2026-10-10"), 1)
+        self.assertEqual(
+            self.store.counts_for_accounts(["a", "b"], "2026-10-09"),
+            {("a", -1): 1, ("a", -2): 1, ("b", -1): 1},
+        )
+        self.assertEqual(self.store.counts_for_accounts(["b"], "2026-10-09"), {("b", -1): 1})
+        self.assertEqual(self.store.counts_for_accounts(["a"], "2026-10-10"), {("a", -1): 1})
+        self.assertEqual(self.store.counts_for_accounts([], "2026-10-09"), {})
 
     def test_failed_and_unknown_sends_do_not_count(self):
         for request_id, unknown in [("failed", False), ("unknown", True)]:

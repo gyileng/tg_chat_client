@@ -264,6 +264,19 @@ class Store:
         with self.connect() as db:
             return db.execute(query, args).fetchone()[0]
 
+    def counts_for_accounts(self, account_ids, day=None):
+        account_ids = list(account_ids)
+        if not account_ids:
+            return {}
+        placeholders = ",".join("?" for _ in account_ids)
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT account_id,chat_id,total FROM counts "
+                f"WHERE day=? AND account_id IN ({placeholders})",
+                [day or day_key(), *account_ids],
+            )
+            return {(aid, chat): total for aid, chat, total in rows}
+
     def export_settings(self):
         # For local settings UI only, never diagnostics or logs.
         return self.setting("connection", {})

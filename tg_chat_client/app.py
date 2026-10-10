@@ -10,7 +10,6 @@ from PySide6.QtCore import QLockFile, QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .bridge import ServiceBridge
-from .service import prune_cache
 from .store import Store
 from .ui import MainWindow
 
@@ -82,7 +81,6 @@ def main(argv=None):
         logging.getLogger("telethon").addHandler(logging.NullHandler())
         logging.getLogger("telethon").propagate = False
         sys.excepthook = report_ui_exception
-        prune_cache(root)
         bridge = ServiceBridge(store, args.mock)
         window = MainWindow(store, bridge, args.mock)
         app.setQuitOnLastWindowClosed(window.tray is None)
