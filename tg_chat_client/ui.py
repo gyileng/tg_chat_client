@@ -530,11 +530,6 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         outer = QVBoxLayout(central)
         toolbar = QHBoxLayout()
-        self.settings_button = QPushButton("连接设置")
-        self.settings_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.settings_button.clicked.connect(lambda: self.open_connection_settings())
-        self.settings_button.setObjectName("connectionSettingsButton")
-        toolbar.addWidget(self.settings_button)
         for text, callback in [
             ("添加 / 重新登录", self.open_login),
             ("重新连接", self.reconnect),

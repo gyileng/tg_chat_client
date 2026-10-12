@@ -1,5 +1,15 @@
 # 会话交接
 
+## 清理临时诊断与重复连接设置按钮（2026-10-12）
+
+用户看到“Telegram 要求等待 9 秒”，确认无需继续排查，要求去掉刚才未提交的置灰原因提示和诊断日志。已撤回该轮全部源码、测试及说明改动，保持已提交版本的 Telegram 等待规则、原有提示和错误类别日志。
+
+按用户反馈去掉第二行工具栏的重复“连接设置”按钮，保留“设置 → 连接设置”和 Ctrl+,；首次未配置的真实启动仍自动打开设置窗口。保留 ShortcutFilter 继承 QObject 的菜单遮挡修复。原按钮回归改为菜单实际鼠标点击，继续检查首次保存后重开、代理修改与取消、窗口归属/复用、受阻原因、键盘入口；工具栏从“添加 / 重新登录”开始，Tab 顺序正常。
+
+macOS Python 3.12、Qt offscreen 下完整 **164 项测试及 2 项子测试通过**；Ruff 静态、格式及 `git diff --check` 通过。菜单坐标点击、托盘恢复后的菜单打开与程序退出回归继续通过。已检查模拟截图 `/private/tmp/tg-chat-single-settings-entry.png`，README、开发计划与包内使用说明已同步入口。
+
+验证命令：`rtk proxy env QT_QPA_PLATFORM=offscreen /private/tmp/tg-chat-venv/bin/python -m pytest -q`。未连接 Telegram、未构建或发布 Windows 包；待新版 Windows 包复核菜单和 Ctrl+, 入口。
+
 ## 消息发送者全名修复（2026-10-12）
 
 用户反馈昵称只显示一半。根因是 TelegramService.convert 只取 first_name，遗漏 last_name，并非气泡裁剪。改用 Telethon get_display_name，完整合并名字与姓氏，同时保留群组/频道 title；无显示名时回退 username 或“未知发送者”。历史消息、实时消息和引用均使用同一完整名称。新登录账号标签也保存完整显示名；已有账号标签保留本地记录，重新登录时更新。不增加发送成功后的姓名网络查询，仍直接显示“我”。

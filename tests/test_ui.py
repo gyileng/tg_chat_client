@@ -35,6 +35,11 @@ def click_top_menu(window, qtbot, name, action=None):
         menu.close()
 
 
+def click_connection_settings(window, qtbot):
+    menu = window.menuBar().actions()[0].menu()
+    click_top_menu(window, qtbot, "设置", menu.actions()[0])
+
+
 @pytest.mark.parametrize("name", ["设置", "程序"])
 def test_top_menu_mouse_click_opens_repeatedly_after_tray_restore(tray_window, qtbot, name):
     click_top_menu(tray_window, qtbot, name)
@@ -200,7 +205,6 @@ def test_close_when_tray_becomes_unavailable_exits(tray_window, monkeypatch):
 
 def test_first_run_settings_can_reopen_after_saving_without_accounts(qtbot, tmp_path):
     from PySide6.QtCore import QObject, QTimer, Signal
-    from PySide6.QtWidgets import QPushButton
 
     from tg_chat_client.ui import SettingsDialog
 
@@ -235,8 +239,7 @@ def test_first_run_settings_can_reopen_after_saving_without_accounts(qtbot, tmp_
     qtbot.waitUntil(lambda: "reconnect" in bridge.calls)
     assert window.accounts.count() == 0
 
-    button = next(b for b in window.findChildren(QPushButton) if b.text() == "连接设置")
-    qtbot.mouseClick(button, Qt.MouseButton.LeftButton)
+    click_connection_settings(window, qtbot)
     dialog = window.settings_dialog
     assert isinstance(dialog, SettingsDialog)
     assert dialog.isVisible()
@@ -245,9 +248,7 @@ def test_first_run_settings_can_reopen_after_saving_without_accounts(qtbot, tmp_
     window.request_exit()
 
 
-def test_connection_settings_button_reopens_and_updates_proxy(window, qtbot, monkeypatch):
-    from PySide6.QtWidgets import QPushButton
-
+def test_connection_settings_menu_reopens_and_updates_proxy(window, qtbot, monkeypatch):
     from tg_chat_client.models import ProxyConfig
     from tg_chat_client.ui import SettingsDialog
 
@@ -255,8 +256,7 @@ def test_connection_settings_button_reopens_and_updates_proxy(window, qtbot, mon
     window.mock = False
     calls = []
     monkeypatch.setattr(window.bridge, "submit", lambda op, **kw: calls.append(op))
-    button = next(b for b in window.findChildren(QPushButton) if b.text() == "连接设置")
-    qtbot.mouseClick(button, Qt.MouseButton.LeftButton)
+    click_connection_settings(window, qtbot)
     dialog = window.settings_dialog
     assert isinstance(dialog, SettingsDialog)
     assert dialog.isVisible()
@@ -266,7 +266,7 @@ def test_connection_settings_button_reopens_and_updates_proxy(window, qtbot, mon
     assert window.store.export_settings()["proxy"]["port"] == 7893
     assert calls == ["reconnect"]
 
-    qtbot.mouseClick(button, Qt.MouseButton.LeftButton)
+    click_connection_settings(window, qtbot)
     dialog = window.settings_dialog
     assert dialog.isVisible()
     assert dialog.port.value() == 7893
@@ -281,7 +281,7 @@ def test_settings_dialog_is_owned_visible_and_reused(window, qtbot):
 
     window.mock = False
     window.store.save_connection(123, "test-private-hash", ProxyConfig(port=7892))
-    qtbot.mouseClick(window.settings_button, Qt.MouseButton.LeftButton)
+    click_connection_settings(window, qtbot)
     dialog = window.settings_dialog
     assert dialog.isVisible()
     assert window.geometry().intersects(dialog.geometry())
@@ -290,7 +290,7 @@ def test_settings_dialog_is_owned_visible_and_reused(window, qtbot):
     dialog.reject()
 
 
-def test_settings_button_tab_order_and_keyboard_activation(window, qtbot, monkeypatch):
+def test_toolbar_has_no_duplicate_settings_and_shortcut_opens_dialog(window, qtbot):
     from PySide6.QtWidgets import QPushButton
 
     from tg_chat_client.models import ProxyConfig
@@ -298,24 +298,21 @@ def test_settings_button_tab_order_and_keyboard_activation(window, qtbot, monkey
     window.mock = False
     window.store.save_connection(123, "test-only-hash", ProxyConfig(port=7892))
     window.activateWindow()
-    window.settings_button.setFocus()
-    qtbot.waitUntil(window.settings_button.hasFocus)
-    assert window.settings_button.isEnabled()
+    buttons = window.findChildren(QPushButton)
+    assert not any(b.text() == "连接设置" for b in buttons)
+    first_button = next(b for b in buttons if b.text() == "添加 / 重新登录")
+    first_button.setFocus()
+    qtbot.waitUntil(first_button.hasFocus)
     assert (
-        QApplication.widgetAt(
-            window.settings_button.mapToGlobal(window.settings_button.rect().center())
-        )
-        is window.settings_button
+        QApplication.widgetAt(first_button.mapToGlobal(first_button.rect().center()))
+        is first_button
     )
-    qtbot.keyClick(window.settings_button, Qt.Key.Key_Tab)
+    qtbot.keyClick(first_button, Qt.Key.Key_Tab)
     next_button = QApplication.focusWidget()
     assert isinstance(next_button, QPushButton)
-    assert next_button.text() == "添加 / 重新登录"
+    assert next_button.text() == "重新连接"
     qtbot.keyClick(next_button, Qt.Key.Key_Tab, Qt.KeyboardModifier.ShiftModifier)
-    assert window.settings_button.hasFocus()
-    qtbot.keyClick(window.settings_button, Qt.Key.Key_Space)
-    assert window.settings_dialog.isVisible()
-    window.settings_dialog.reject()
+    assert first_button.hasFocus()
     window.input.setFocus()
     qtbot.keyClick(window.input, Qt.Key.Key_Comma, Qt.KeyboardModifier.ControlModifier)
     assert window.settings_dialog.isVisible()
@@ -324,7 +321,7 @@ def test_settings_button_tab_order_and_keyboard_activation(window, qtbot, monkey
 
 @pytest.mark.parametrize("blocked", ["mock", "send", "account", "login"])
 def test_connection_settings_explains_why_it_cannot_open(window, qtbot, monkeypatch, blocked):
-    from PySide6.QtWidgets import QDialog, QMessageBox, QPushButton
+    from PySide6.QtWidgets import QDialog, QMessageBox
 
     from tg_chat_client.models import ProxyConfig
 
@@ -340,8 +337,7 @@ def test_connection_settings_explains_why_it_cannot_open(window, qtbot, monkeypa
         window.login_dialog.show()
     messages = []
     monkeypatch.setattr(QMessageBox, "information", lambda *args: messages.append(args[2]))
-    button = next(b for b in window.findChildren(QPushButton) if b.text() == "连接设置")
-    qtbot.mouseClick(button, Qt.MouseButton.LeftButton)
+    window.menuBar().actions()[0].menu().actions()[0].trigger()
     assert len(messages) == 1
     assert messages[0] == window.notice.text()
     assert window.store.export_settings() == before
