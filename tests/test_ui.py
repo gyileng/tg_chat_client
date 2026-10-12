@@ -5,12 +5,72 @@ import pytest
 pytest.importorskip("PySide6")
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QInputMethodEvent, QKeyEvent, QTextCursor
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QSystemTrayIcon
 
 from tg_chat_client.bridge import ServiceBridge
 from tg_chat_client.models import SendRequest
 from tg_chat_client.store import Store
 from tg_chat_client.ui import Composer, MainWindow
+
+
+def click_top_menu(window, qtbot, name, action=None):
+    bar = window.menuBar()
+    title = next(a for a in bar.actions() if a.text() == name)
+    point = bar.mapToGlobal(bar.actionGeometry(title).center())
+    assert QApplication.widgetAt(point) is bar
+    menu = title.menu()
+    # Send to the window so Qt routes by position, rather than bypassing hit testing.
+    QTest.mouseClick(
+        window.windowHandle(), Qt.MouseButton.LeftButton, pos=window.mapFromGlobal(point)
+    )
+    qtbot.waitUntil(menu.isVisible)
+    assert QApplication.activePopupWidget() is menu
+    try:
+        if action is not None:
+            qtbot.mouseClick(
+                menu, Qt.MouseButton.LeftButton, pos=menu.actionGeometry(action).center()
+            )
+    finally:
+        menu.close()
+
+
+@pytest.mark.parametrize("name", ["设置", "程序"])
+def test_top_menu_mouse_click_opens_repeatedly_after_tray_restore(tray_window, qtbot, name):
+    click_top_menu(tray_window, qtbot, name)
+    click_top_menu(tray_window, qtbot, name)
+    tray_window.close()
+    tray_window.restore_window()
+    qtbot.waitUntil(tray_window.isVisible)
+    click_top_menu(tray_window, qtbot, name)
+
+
+def test_settings_menu_mouse_selection_opens_and_reopens_dialog(window, qtbot):
+    from tg_chat_client.models import ProxyConfig
+
+    window.mock = False
+    window.store.save_connection(123, "test-only-hash", ProxyConfig(port=7892))
+    window.input.setPlainText("菜单操作保留草稿")
+    for _ in range(2):
+        settings_menu = window.menuBar().actions()[0].menu()
+        click_top_menu(window, qtbot, "设置", settings_menu.actions()[0])
+        assert window.settings_dialog.isVisible()
+        assert window.settings_dialog.port.value() == 7892
+        window.settings_dialog.reject()
+    assert window.input.toPlainText() == "菜单操作保留草稿"
+
+
+def test_application_menu_mouse_selection_exits_with_tray(tray_window, qtbot):
+    window = tray_window
+    target = window.target
+    window.input.setPlainText("退出保存草稿")
+    quits = []
+    window.quit_requested.connect(lambda: quits.append(True))
+    click_top_menu(window, qtbot, "程序", window.exit_action)
+    assert window.closing and window.bridge.closed
+    assert not window.isVisible() and not window.tray.isVisible()
+    assert window.store.draft(*target)["text"] == "退出保存草稿"
+    assert quits == [True]
 
 
 def test_tray_close_preserves_draft_quote_and_live_service(tray_window, qtbot):

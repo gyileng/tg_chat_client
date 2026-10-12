@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from math import ceil
 from uuid import uuid4
 
-from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -1552,10 +1552,11 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-class ShortcutFilter(QWidget):
+class ShortcutFilter(QObject):
     """Application filter reaches focused text fields, but never acts in other apps/dialogs."""
 
     def __init__(self, window):
+        # A QWidget child would show over the top-left menu bar and intercept clicks.
         super().__init__(window)
         self.window = window
 
