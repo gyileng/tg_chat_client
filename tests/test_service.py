@@ -21,13 +21,14 @@ class ControlledService:
 
     async def send(self, request):
         self.calls.append(request)
+        message_id = len(self.calls)
         await self.release.wait()
         if self.error:
             raise self.error
         return ChatMessage(
             request.account_id,
             request.chat_id,
-            len(self.calls),
+            message_id,
             "我",
             request.text,
             "12:00",
@@ -95,15 +96,98 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         client.send_message.assert_awaited_once()
         message.get_sender.assert_not_awaited()
 
-    async def test_second_send_to_busy_target_is_rejected(self):
+    async def test_sender_display_name_includes_last_name_and_preserves_fallbacks(self):
+        from telethon.tl.types import ChatForbidden, User
+
+        service = TelegramService(self.store, self.events.append)
+        cases = (
+            (User(42, first_name="Ada", last_name="Lovelace", username="alias"), "Ada Lovelace"),
+            (User(42, first_name="名字", last_name="另一半"), "名字 另一半"),
+            (User(42, first_name="只有名字"), "只有名字"),
+            (User(42, last_name="只有姓氏"), "只有姓氏"),
+            (User(42, username="alias"), "alias"),
+            (ChatForbidden(42, "群组全名"), "群组全名"),
+            (None, "未知发送者"),
+        )
+        for sender, expected in cases:
+            message = SimpleNamespace(
+                get_sender=AsyncMock(return_value=sender),
+                sender_id=42,
+                chat_id=-1,
+                id=1,
+                raw_text="正文",
+                date=datetime.now(timezone.utc),
+                out=False,
+                reply_to_msg_id=None,
+                **{
+                    kind: None
+                    for kind in (
+                        "photo",
+                        "sticker",
+                        "video",
+                        "gif",
+                        "voice",
+                        "audio",
+                        "document",
+                        "media",
+                    )
+                },
+            )
+            result = await service.convert("a", message)
+            self.assertEqual(result.sender, expected)
+            self.assertEqual(result.text, "正文")
+            self.assertEqual(result.sender_id, 42)
+
+    async def test_login_account_label_uses_full_name(self):
+        from telethon.tl.types import User
+
+        service = TelegramService(self.store, self.events.append)
+        client = Mock()
+        client.sign_in = AsyncMock()
+        client.get_me = AsyncMock(return_value=User(42, first_name="Ada", last_name="Lovelace"))
+        service.clients["a"] = client
+        service.codes["a"] = {"phone": "+123", "hash": "test"}
+        await service.sign_in("a", code="12345")
+        self.assertEqual(self.store.accounts()[0]["label"], "Ada Lovelace")
+
+    async def test_multiple_sends_to_same_target_are_tracked_independently(self):
         first = asyncio.create_task(self.send(self.request()))
-        await asyncio.sleep(0)
-        await self.send(self.request("second"))
-        self.assertEqual(self.events[-1]["kind"], "error")
+        second = asyncio.create_task(self.send(self.request("second")))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        self.assertEqual(len(self.service.calls), 2)
+        self.assertEqual(len(self.runtime.busy), 2)
         self.service.release.set()
+        await asyncio.gather(first, second)
+        self.assertEqual(self.store.count("a", -1), 2)
+        self.assertFalse(self.runtime.busy)
+
+    async def test_one_send_finishing_does_not_release_other_send_protection(self):
+        releases = {rid: asyncio.Event() for rid in ("first", "second")}
+
+        async def send(request):
+            await releases[request.request_id].wait()
+            return ChatMessage(
+                "a",
+                -1,
+                1 if request.request_id == "first" else 2,
+                "我",
+                request.text,
+                "12:00",
+                True,
+            )
+
+        self.service.send = send
+        first = asyncio.create_task(self.send(self.request("first")))
+        second = asyncio.create_task(self.send(self.request("second")))
+        await asyncio.sleep(0)
+        releases["second"].set()
+        await second
+        await self.runtime.execute("reconnect", "reconnect", {})
+        self.assertIn("等待发送", self.events[-1]["message"])
+        releases["first"].set()
         await first
-        self.assertEqual(len(self.service.calls), 1)
-        self.assertEqual(self.store.count("a", -1), 1)
+        self.assertEqual(self.store.count("a", -1), 2)
 
     async def test_other_account_can_send_and_frozen_target_is_preserved(self):
         first = asyncio.create_task(self.send(self.request()))

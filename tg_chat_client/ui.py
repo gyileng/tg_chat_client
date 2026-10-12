@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
 
 from .message_cache import MessageCache
 from .message_view import MESSAGE_ROLE, MessageList, media_text
-from .models import BEIJING, ProxyConfig, SendRequest, day_key
+from .models import BEIJING, ChatMessage, ProxyConfig, SendRequest, day_key
 from .native_ime import cancel_windows_composition
 from .store import validate_phrase_alias
 
@@ -480,6 +480,8 @@ class MainWindow(QMainWindow):
         self.notice_text = None
         self.statuses = {}
         self.pending_sends = {}
+        self.pending_messages = {}
+        self.local_message_id = 1 << 62
         self.blocked = {}
         self.blocked_accounts = {}
         self.group_requests = {}
@@ -1002,6 +1004,9 @@ class MainWindow(QMainWindow):
 
     def quote(self, item):
         message = item.data(MESSAGE_ROLE)
+        if message and message.pending:
+            self.set_notice("消息仍在发送，成功后才能引用。")
+            return
         if message:
             self.reply_id = message.message_id
             self.reply_text = f"{message.sender}：{message.text or media_text(message.media)}"
@@ -1019,8 +1024,12 @@ class MainWindow(QMainWindow):
         if item.isValid():
             menu = QMenu(self)
             action = menu.addAction("引用回复")
-            if menu.exec(self.messages.viewport().mapToGlobal(pos)) == action:
+            copy_action = menu.addAction("复制消息文字")
+            chosen = menu.exec(self.messages.viewport().mapToGlobal(pos))
+            if chosen == action:
                 self.quote(item)
+            elif chosen == copy_action:
+                self.messages.copy_messages([item])
 
     def load_history(self, older=False):
         if self.closing or not self.account_id or self.chat_id is None:
@@ -1054,8 +1063,15 @@ class MainWindow(QMainWindow):
         anchor = self.messages.anchor() if keep_scroll else self.scroll_positions.get(self.target)
         self.rendering = True
         self.message_sync_timer.stop()
-        view = self.cache.view(self.target)
+        view = dict(self.cache.view(self.target))
+        if self.target not in self.cache.history:
+            view.update(
+                (m.message_id, m)
+                for m in self.pending_messages.values()
+                if (m.account_id, m.chat_id) == self.target
+            )
         self.messages.model().sync(self.target, view)
+        self.messages.set_pending(any(m.pending for m in view.values()))
         self.messages.itemDelegate().prune(view.values())
         self.messages.doItemsLayout()
         self.messages.restore_anchor(anchor)
@@ -1129,6 +1145,7 @@ class MainWindow(QMainWindow):
             self.timer.stop()
         self.message_resize_timer.stop()
         self.message_sync_timer.stop()
+        self.messages.set_pending(False)
         self.resize_pending = False
         self.messages.setUpdatesEnabled(False)
 
@@ -1196,9 +1213,6 @@ class MainWindow(QMainWindow):
         deadline = max(
             self.blocked.get(self.target, 0), self.blocked_accounts.get(self.account_id, 0)
         )
-        if self.target in self.pending_sends:
-            self.set_notice("上一条仍在发送，当前草稿已保留；发送结束后请再按 Enter。")
-            return
         if deadline > time.monotonic():
             self.set_notice("Telegram 等待时间尚未结束，当前草稿已保留。")
             return
@@ -1208,13 +1222,26 @@ class MainWindow(QMainWindow):
         self.save_draft()
         request = SendRequest(uuid4().hex, self.account_id, self.chat_id, text, self.reply_id)
         self.bridge.submit("send", request=request)
-        self.pending_sends[self.target] = (request, source, self.reply_text)
+        self.pending_sends[request.request_id] = (request, source, self.reply_text)
+        self.local_message_id += 1
+        self.pending_messages[request.request_id] = ChatMessage(
+            request.account_id,
+            request.chat_id,
+            self.local_message_id,
+            "我",
+            request.text,
+            datetime.now(BEIJING).strftime("%H:%M"),
+            True,
+            request.reply_to,
+            pending=True,
+        )
         if source == "input":
             self.reply_id, self.reply_text = None, ""
             self.quote_label.setText("双击消息引用回复")
             self.input.clear()
             self.save_draft()
-        self.set_notice("正在发送；账号和目标群已固定。")
+        self.go_bottom(refresh=False)
+        self.set_notice("消息已提交，可继续输入并手动发送下一条。")
         self.refresh_counts()
 
     def refresh_counts(self):
@@ -1257,11 +1284,11 @@ class MainWindow(QMainWindow):
                     self.timer.start(1000)
             else:
                 self.timer.stop()
-        busy = self.target in self.pending_sends
-        online = self.statuses.get(self.account_id) in {"已连接", "模拟连接"}
-        self.send_button.setEnabled(
-            valid and online and not self.account_actions and not busy and not wait
+        pending_count = sum(
+            (m.account_id, m.chat_id) == self.target for m in self.pending_messages.values()
         )
+        online = self.statuses.get(self.account_id) in {"已连接", "模拟连接"}
+        self.send_button.setEnabled(valid and online and not self.account_actions and not wait)
         self.phrase_widget.setEnabled(valid)
         self.input.setEnabled(valid)
         self.older.setEnabled(
@@ -1282,8 +1309,9 @@ class MainWindow(QMainWindow):
         self.identity.setText(
             f"当前账号：{label}　→　{group}　|　本群今日工具发送：{count} 条"
             + (f"　等待 {wait} 秒" if wait else "")
+            + (f"　发送中 {pending_count} 条" if pending_count else "")
         )
-        self.send_button.setText("发送中…" if busy else "发送文字（Enter）")
+        self.send_button.setText("发送文字（Enter）")
 
     def handle(self, event):
         if self.closing:
@@ -1347,10 +1375,10 @@ class MainWindow(QMainWindow):
         if operation == "send":
             request = event["request"]
             target = request.account_id, request.chat_id
-            pending = self.pending_sends.get(target)
-            if pending and pending[0].request_id != request.request_id:
+            pending = self.pending_sends.pop(request.request_id, None)
+            if pending is None:
                 return
-            self.pending_sends.pop(target, None)
+            self.pending_messages.pop(request.request_id, None)
             if kind == "result":
                 self.counts_dirty = True
                 if pending and pending[1] != "input":
@@ -1389,6 +1417,8 @@ class MainWindow(QMainWindow):
                     self.set_notice(
                         event["message"] + "；原文本已恢复到该聊天草稿开头，请核对后手动发送。"
                     )
+                if target == self.target:
+                    self.render_messages(keep_scroll=True)
         elif operation == "groups":
             aid = event["account_id"]
             if event["request_id"] != self.group_requests.get(aid):
@@ -1515,6 +1545,7 @@ class MainWindow(QMainWindow):
         self.day_timer.stop()
         self.message_resize_timer.stop()
         self.message_sync_timer.stop()
+        self.messages.set_pending(False)
         self.bridge.event.disconnect(self.handle)
         QApplication.instance().removeEventFilter(self.shortcut_filter)
         if self.tray:

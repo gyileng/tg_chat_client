@@ -550,7 +550,7 @@ def test_enter_sends_once_and_shift_enter_adds_newline(window, qtbot):
     assert "\n" in window.input.toPlainText()
 
 
-def test_submit_clears_immediately_and_success_preserves_identical_next_draft(
+def test_consecutive_submits_show_pending_bubbles_and_handle_out_of_order_results(
     window, qtbot, monkeypatch
 ):
     calls = []
@@ -566,25 +566,108 @@ def test_submit_clears_immediately_and_success_preserves_identical_next_draft(
     assert window.reply_id is None
 
     window.input.setPlainText("重复短句")
-    window.quote(window.messages.model().index(0))
-    qtbot.keyClick(window.input, Qt.Key.Key_Return)
-    assert len(calls) == 1
-    assert "上一条仍在发送" in window.notice.text()
+    assert window.send_button.isEnabled()
+    qtbot.mouseClick(window.send_button, Qt.MouseButton.LeftButton)
+    assert len(calls) == 2
+    second = calls[1]["request"]
+    assert window.input.toPlainText() == ""
+    pending = [m for m in window.messages.model().messages if m.pending]
+    assert len(pending) == 2
+    assert [m.text for m in pending] == ["重复短句", "重复短句"]
+    assert window.messages.pending_timer.isActive()
+    window.quote(window.messages.model().index_for(pending[0].message_id))
+    assert window.reply_id is None
+    window.input.setPlainText("重复短句")
     message = replace(
         next(iter(window.buffers[window.target].values())),
         message_id=99999,
         text=request.text,
     )
+    window.handle({"kind": "result", "operation": "send", "request": second, "result": message})
+    assert len(window.pending_sends) == 1
+    assert window.send_button.isEnabled()
+    assert sum(m.pending for m in window.messages.model().messages) == 1
+    window.handle({"kind": "result", "operation": "send", "request": second, "result": message})
+    assert len(window.pending_sends) == 1
     window.handle({"kind": "result", "operation": "send", "request": request, "result": message})
+    assert not window.pending_sends
+    assert not window.messages.pending_timer.isActive()
+    assert not any(m.pending for m in window.messages.model().messages)
     assert window.input.toPlainText() == "重复短句"
-    assert window.reply_id == reply_id
+
+
+@pytest.mark.parametrize("scope", ["account", "target"])
+def test_wait_blocks_new_sends_without_losing_other_pending_message(
+    window, qtbot, monkeypatch, scope
+):
+    import time
+
+    calls = []
+    monkeypatch.setattr(window.bridge, "submit", lambda operation, **args: calls.append(args))
+    for text in ("第一条", "第二条"):
+        window.input.setPlainText(text)
+        qtbot.keyClick(window.input, Qt.Key.Key_Return)
+    first, second = [call["request"] for call in calls]
+    window.handle(
+        {
+            "kind": "error",
+            "operation": "send",
+            "request": first,
+            "message": "Telegram 要求等待 30 秒",
+            "wait": 30,
+            "wait_scope": scope,
+        }
+    )
+    assert second.request_id in window.pending_sends
+    assert sum(m.pending for m in window.messages.model().messages) == 1
+    assert not window.send_button.isEnabled()
+    window.input.setPlainText("限流期间的新草稿")
     qtbot.keyClick(window.input, Qt.Key.Key_Return)
     assert len(calls) == 2
-    assert calls[1]["request"].text == "重复短句"
-    assert window.input.toPlainText() == ""
-    window.handle({"kind": "result", "operation": "send", "request": request, "result": message})
-    assert window.pending_sends[window.target][0] == calls[1]["request"]
-    window.pending_sends.clear()
+    assert window.input.toPlainText() == "限流期间的新草稿"
+    waits = window.blocked_accounts if scope == "account" else window.blocked
+    key = window.account_id if scope == "account" else window.target
+    waits[key] = time.monotonic() - 1
+    window.refresh_counts()
+    assert window.send_button.isEnabled()
+
+
+def test_pending_bubbles_follow_account_and_pause_animation_in_tray(
+    tray_window, qtbot, monkeypatch
+):
+    window = tray_window
+    calls = []
+    original_submit = window.bridge.submit
+
+    def submit(operation, **args):
+        if operation == "send":
+            calls.append(args["request"])
+        else:
+            return original_submit(operation, **args)
+
+    monkeypatch.setattr(window.bridge, "submit", submit)
+    for text in ("第一条", "第二条"):
+        window.input.setPlainText(text)
+        qtbot.keyClick(window.input, Qt.Key.Key_Return)
+    window.accounts.setCurrentRow(1)
+    qtbot.waitUntil(lambda: window.chat_id is not None and not window.history_requests)
+    assert not any(m.pending for m in window.messages.model().messages)
+    assert not window.messages.pending_timer.isActive()
+    window.accounts.setCurrentRow(0)
+    qtbot.waitUntil(lambda: window.chat_id is not None and not window.history_requests)
+    assert sum(m.pending for m in window.messages.model().messages) == 2
+    window.input.setPlainText("新草稿")
+    window.close()
+    assert not window.messages.pending_timer.isActive()
+    for request in reversed(calls):
+        window.handle(
+            {"kind": "error", "operation": "send", "request": request, "message": "发送结果不确定"}
+        )
+    assert window.store.draft(*window.target)["text"] == "第一条\n第二条\n新草稿"
+    window.restore_window()
+    assert window.input.toPlainText() == "第一条\n第二条\n新草稿"
+    assert not any(m.pending for m in window.messages.model().messages)
+    assert not window.messages.pending_timer.isActive()
 
 
 @pytest.mark.parametrize("next_draft", ["", "下一句"])
@@ -667,6 +750,7 @@ def test_other_account_send_result_preserves_scroll(window, qtbot):
     messages = window.buffers[original]
     message = replace(messages[max(messages)], message_id=max(messages) + 1, outgoing=True)
     request = SendRequest("other-account-send", *original, message.text)
+    window.pending_sends[request.request_id] = (request, "input", "")
     window.accounts.setCurrentRow(1)
     qtbot.waitUntil(
         lambda: (
@@ -1302,6 +1386,71 @@ def test_message_context_menu_quotes_right_bubble(window, qtbot):
     assert window.reply_id == outgoing_item.data(Qt.ItemDataRole.UserRole)
 
 
+def test_message_context_menu_copies_clicked_message_without_changing_draft(window, qtbot):
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QMenu
+
+    from tg_chat_client.models import ChatMessage
+
+    message = ChatMessage(*window.target, 9100, "昵称", "原文字\n第二行 <b>不是格式</b>", "12:00")
+    window.put_message(message)
+    window.render_messages()
+    index = window.messages.model().index_for(9100)
+    window.messages.scrollTo(index)
+    window.input.setPlainText("保留草稿")
+    window.quote(window.messages.model().index(0))
+    reply_id = window.reply_id
+    pos = window.messages.itemDelegate().bubble_rect(index).center().toPoint()
+
+    def choose_copy():
+        menu = QApplication.activePopupWidget()
+        assert isinstance(menu, QMenu)
+        try:
+            action = next(a for a in menu.actions() if a.text() == "复制消息文字")
+            menu.setActiveAction(action)
+            qtbot.keyClick(menu, Qt.Key.Key_Return)
+        finally:
+            menu.close()
+
+    QTimer.singleShot(0, choose_copy)
+    window.message_menu(pos)
+    assert QApplication.clipboard().text() == message.text
+    assert window.input.toPlainText() == "保留草稿"
+    assert window.reply_id == reply_id
+
+
+def test_ctrl_c_copies_selected_messages_in_display_order(window, qtbot):
+    from PySide6.QtCore import QItemSelectionModel
+
+    from tg_chat_client.models import ChatMessage
+
+    for mid, text, media in ((9101, "第一条\n第二行", ""), (9102, "", "photo")):
+        window.put_message(ChatMessage(*window.target, mid, "昵称", text, "12:00", media=media))
+    window.render_messages()
+    selection = window.messages.selectionModel()
+    selection.clearSelection()
+    for mid in (9102, 9101):
+        selection.select(
+            window.messages.model().index_for(mid), QItemSelectionModel.SelectionFlag.Select
+        )
+    window.messages.setFocus()
+    qtbot.keyClick(window.messages, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+    assert QApplication.clipboard().text() == "第一条\n第二行\n[图片]"
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_short_message_uses_two_lines_with_time_in_header(window, pending):
+    from tg_chat_client.models import ChatMessage
+
+    message = ChatMessage(*window.target, 9103, "昵称", "短句", "12:00", pending=pending)
+    doc, _ = window.messages.itemDelegate().layout(message, window.messages.font())
+    lines = doc.toPlainText().splitlines()
+    assert len(lines) == 2
+    assert "昵称" in lines[0] and "12:00" in lines[0]
+    assert lines[1] == "短句"
+    assert doc.begin().layout().lineCount() == 1
+
+
 def test_message_resize_wraps_text_and_preserves_scroll(window, qtbot):
     from tg_chat_client.models import ChatMessage
 
@@ -1321,6 +1470,7 @@ def test_message_resize_wraps_text_and_preserves_scroll(window, qtbot):
     assert narrow.width() <= (window.messages.viewport().width() - 16) * 0.75
     assert narrow.height() > wide.height()
     assert "[图片]" in doc.toPlainText()
+    assert message.sender in doc.toPlainText()
     assert window.messages.horizontalScrollBar().maximum() == 0
     window.messages.verticalScrollBar().setValue(0)
     window.resize(1000, 700)

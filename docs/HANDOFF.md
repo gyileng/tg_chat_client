@@ -1,5 +1,33 @@
 # 会话交接
 
+## 消息发送者全名修复（2026-10-12）
+
+用户反馈昵称只显示一半。根因是 TelegramService.convert 只取 first_name，遗漏 last_name，并非气泡裁剪。改用 Telethon get_display_name，完整合并名字与姓氏，同时保留群组/频道 title；无显示名时回退 username 或“未知发送者”。历史消息、实时消息和引用均使用同一完整名称。新登录账号标签也保存完整显示名；已有账号标签保留本地记录，重新登录时更新。不增加发送成功后的姓名网络查询，仍直接显示“我”。
+
+先增加两项回归，修复前均失败，实际返回 Ada 而非 Ada Lovelace。修复后 macOS Python 3.12、Qt offscreen 下服务与界面 **123 项测试及 2 项子测试通过**；Ruff 静态、格式及 `git diff --check` 通过。覆盖中英文完整姓名、仅名字/仅姓氏、username/未知发送者回退、群组 title、新登录账号标签；长昵称界面回归增加完整正文姓名保留检查，确认换行不截断。
+
+验证命令：`rtk proxy env QT_QPA_PLATFORM=offscreen /private/tmp/tg-chat-venv/bin/python -m pytest tests/test_service.py tests/test_ui.py -q`。未连接 Telegram、未构建或发布 Windows 包；需新版 Windows 包实测完整姓名，已在窗口缓存的旧消息需重新加载或重启后读取。
+
+## 消息复制与两行紧凑显示（2026-10-12）
+
+用户反馈消息区无法复制，要求将昵称、正文、时间三行压缩为两行。保留增量 QListView 和绘制委托，右键菜单增加“复制消息文字”，复制所点消息的原正文；选中消息后 Ctrl+C 支持复制，Ctrl/Shift 可多选，按显示顺序以换行分隔。复制保留原换行与特殊字符，不附加昵称、时间或发送状态，无正文媒体复制类型占位。选中气泡加蓝色边框，不改变草稿或引用；原双击/右键引用保留。
+
+第一行合并昵称、灰色时间、回复编号和发送状态，第二行显示正文与媒体类型占位；缩小内边距、段落和气泡间距。长正文或昵称仍自然换行、不截断；未完成消息的转圈标记移到首行右侧，保留多条等待与后台停止动画的行为。
+
+macOS Python 3.12、Qt offscreen 下完整 **162 项测试及 2 项子测试通过**；Ruff 静态、格式及 `git diff --check` 通过。新增回归覆盖真实右键菜单选择复制、原换行及特殊字符保留、复制不修改草稿/引用、Ctrl+C 多条复制的顺序及媒体占位、普通/未完成短消息两行布局。原气泡左右对齐、长文字/窄窗口换行、引用、滚动位置、连续发送与后台暂停测试均通过。已检查宽/窄模拟截图：`/private/tmp/tg-chat-compact-wide.png`、`/private/tmp/tg-chat-compact-narrow.png`。
+
+验证命令：`rtk proxy env QT_QPA_PLATFORM=offscreen /private/tmp/tg-chat-venv/bin/python -m pytest -q`；Ruff 使用同一临时环境。未构建或发布 Windows 包、未连接 Telegram；待新版 Windows 包实测消息复制、Ctrl/Shift 多选、中文正文与两行布局。
+
+## 连续手动发送与独立等待气泡（2026-10-12）
+
+用户反馈官方客户端允许多条消息同时转圈等待，而本工具连续发送时按钮置灰。原限制来自界面和 ServiceRuntime 的同账号同群单条准入规则，并非每次都由 Telegram 限流导致；按本次反馈改为允许多条手动请求同时等待回执，覆盖此前单条发送的产品决定。
+
+界面与服务按请求 ID 独立追踪，提交立即清空输入及引用，上一条未完成也可再次按 Enter 或点击发送。当前聊天底部显示独立临时气泡、“发送中”和转圈标记，身份栏显示未完成条数；成功时替换对应气泡，不改新草稿，重复或迟到回执不影响其他请求。临时气泡不进入消息缓存及成功计数，也不能引用。失败与不确定结果沿用恢复对应原文本至草稿开头的处理，不自动重发。Telegram 限流/慢速模式仍阻止新的提交并显示倒计时，已提交请求独立处理；任一请求未完成时仍阻止连接、登录、退出登录及移除账号。隐藏、最小化和真正退出时停止转圈计时器，恢复时同步消息。
+
+macOS Python 3.12、PySide6/Qt offscreen 下完整 **158 项测试及 2 项子测试通过**；Ruff 静态、格式和 `git diff --check` 通过。新增回归覆盖同群并行发送与独立成功计数、乱序结束仍保持连接操作保护、连续 Enter/按钮提交、相同新草稿保留、重复回执、账号/群级等待阻止新提交、切换账号后的气泡归属、托盘隐藏停止动画及多条失败草稿恢复。已检查宽/窄模拟截图：`/private/tmp/tg-chat-pending-wide.png`、`/private/tmp/tg-chat-pending-narrow.png`。
+
+验证命令：`rtk proxy env QT_QPA_PLATFORM=offscreen /private/tmp/tg-chat-venv/bin/python -m pytest -q`；Ruff 使用同一临时环境。未连接 Telegram、未构建或发布 Windows 包；下一步在新版 Windows 包验证真实连续发送、网络延迟下多条转圈、限流倒计时、账号切换及超时草稿恢复。
+
 ## 设置、程序菜单点击无响应修复（2026-10-12）
 
 用户确认顶部“设置、程序”点击后下拉菜单完全不出现。根因是 `ShortcutFilter` 继承 `QWidget`：作为主窗口子控件随窗口显示，默认区域覆盖左上角菜单栏，鼠标点击命中过滤器控件而不是菜单。新增四项回归在修复前全部失败，`QApplication.widgetAt` 均返回 `ShortcutFilter`。此前增加菜单栏将连接设置按钮下移，避开遮挡，却没有移除遮挡本身。

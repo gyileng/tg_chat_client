@@ -11,10 +11,17 @@ from PySide6.QtCore import (
     QRectF,
     QSize,
     Qt,
+    QTimer,
     Signal,
 )
-from PySide6.QtGui import QColor, QPainter, QTextDocument, QTextOption
-from PySide6.QtWidgets import QAbstractItemView, QListView, QStyledItemDelegate
+from PySide6.QtGui import QColor, QKeySequence, QPainter, QPen, QTextDocument, QTextOption
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QListView,
+    QStyle,
+    QStyledItemDelegate,
+)
 
 from .message_cache import HISTORY_LIMIT
 
@@ -63,7 +70,9 @@ class MessageModel(QAbstractListModel):
         if role == MESSAGE_ROLE:
             return message
         if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.AccessibleTextRole):
-            return f"{message.sender}：{message.text}\n{media_text(message.media)}\n{message.time}"
+            status = " · 发送中" if message.pending else ""
+            body = " ".join(text for text in (message.text, media_text(message.media)) if text)
+            return f"{message.sender}　{message.time}{status}\n{body}"
         return None
 
     def index_for(self, message_id):
@@ -132,24 +141,29 @@ class MessageDelegate(QStyledItemDelegate):
         name = message.sender
         if message.outgoing and name != "我":
             name += "（我）"
-        footer = message.time + (f" · 回复 #{message.reply_to}" if message.reply_to else "")
-        content = [f'<p style="color:{sender_color(message.sender_id)}"><b>{escape(name)}</b></p>']
-        for text in (message.text, media_text(message.media)):
-            if text:
-                content.append("<p>" + escape(text).replace("\n", "<br>") + "</p>")
-        content.append('<p style="color:#666666">' + escape(footer) + "</p>")
+        metadata = message.time + (f" · 回复 #{message.reply_to}" if message.reply_to else "")
+        if message.pending:
+            metadata += " · 发送中…"
+        content = [
+            f'<p><span style="color:{sender_color(message.sender_id)}"><b>{escape(name)}</b></span>'
+            f'<span style="color:#666666">　{escape(metadata)}</span></p>'
+        ]
+        body = " ".join(text for text in (message.text, media_text(message.media)) if text)
+        if body:
+            content.append("<p>" + escape(body).replace("\n", "<br>") + "</p>")
         doc = QTextDocument()
         doc.setDefaultFont(font)
         doc.setDocumentMargin(0)
         option = doc.defaultTextOption()
         option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         doc.setDefaultTextOption(option)
-        doc.setDefaultStyleSheet("p { margin: 0 0 4px 0; color: #202124; white-space: pre-wrap; }")
+        doc.setDefaultStyleSheet("p { margin: 0 0 2px 0; color: #202124; white-space: pre-wrap; }")
         doc.setHtml("".join(content))
         doc.setTextWidth(-1)
-        width = max(24, min(available, ceil(doc.idealWidth()) + 20))
-        doc.setTextWidth(max(1, width - 20))
-        size = QSize(width, ceil(doc.size().height()) + 16)
+        padding = 38 if message.pending else 20
+        width = max(24, min(available, ceil(doc.idealWidth()) + padding))
+        doc.setTextWidth(max(1, width - padding))
+        size = QSize(width, ceil(doc.size().height()) + 10)
         self.layouts[key] = (doc, size)
         while len(self.layouts) > HISTORY_LIMIT:
             self.layouts.popitem(last=False)
@@ -163,7 +177,7 @@ class MessageDelegate(QStyledItemDelegate):
 
     def sizeHint(self, option, index):
         _, size = self.layout(index.data(MESSAGE_ROLE), option.font)
-        return QSize(self.view.viewport().width(), size.height() + 8)
+        return QSize(self.view.viewport().width(), size.height() + 4)
 
     def bubble_rect(self, index):
         _, size = self.layout(index.data(MESSAGE_ROLE), self.view.font())
@@ -173,7 +187,7 @@ class MessageDelegate(QStyledItemDelegate):
             if index.data(MESSAGE_ROLE).outgoing
             else rect.left() + 8
         )
-        return QRectF(x, rect.top() + 4, size.width(), size.height())
+        return QRectF(x, rect.top() + 2, size.width(), size.height())
 
     def paint(self, painter, option, index):
         message = index.data(MESSAGE_ROLE)
@@ -181,13 +195,27 @@ class MessageDelegate(QStyledItemDelegate):
         rect = self.bubble_rect(index)
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setPen(
+            QPen(QColor("#2386c8"), 1)
+            if option.state & QStyle.StateFlag.State_Selected
+            else Qt.PenStyle.NoPen
+        )
         painter.setBrush(QColor("#e7f3ed" if message.outgoing else "#f1f3f5"))
         painter.drawRoundedRect(rect, 8, 8)
         painter.setClipRect(rect)
-        painter.translate(rect.left() + 10, rect.top() + 8)
+        painter.translate(rect.left() + 10, rect.top() + 5)
         doc.drawContents(painter)
         painter.restore()
+        if message.pending:
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(QPen(QColor("#2386c8"), 2))
+            painter.drawArc(
+                QRectF(rect.right() - 22, rect.top() + 7, 12, 12),
+                self.view.spinner_angle * 16,
+                270 * 16,
+            )
+            painter.restore()
 
 
 class MessageList(QListView):
@@ -200,8 +228,42 @@ class MessageList(QListView):
         self.setItemDelegate(MessageDelegate(self))
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.spinner_angle = 0
+        self.pending_timer = QTimer(self)
+        self.pending_timer.setInterval(100)
+        self.pending_timer.timeout.connect(self.animate_pending)
+
+    def copy_messages(self, indexes=None):
+        indexes = self.selectionModel().selectedRows() if indexes is None else indexes
+        texts = []
+        for index in sorted(indexes, key=lambda item: item.row()):
+            message = index.data(MESSAGE_ROLE)
+            if message:
+                texts.append(message.text or media_text(message.media))
+        if texts:
+            QApplication.clipboard().setText("\n".join(texts))
+
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.StandardKey.Copy) or (
+            event.key() == Qt.Key.Key_C and event.modifiers() == Qt.KeyboardModifier.ControlModifier
+        ):
+            self.copy_messages()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def set_pending(self, active):
+        if active:
+            if not self.pending_timer.isActive():
+                self.pending_timer.start()
+        else:
+            self.pending_timer.stop()
+
+    def animate_pending(self):
+        self.spinner_angle = (self.spinner_angle + 30) % 360
+        self.viewport().update()
 
     def viewportEvent(self, event):
         if event.type() == QEvent.Type.Resize:

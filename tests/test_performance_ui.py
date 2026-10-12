@@ -145,7 +145,7 @@ def test_midnight_and_hidden_send_failure_preserve_draft(tray_window, qtbot, mon
         window.store, "counts_for_accounts", lambda *args: queries.append(True) or original(*args)
     )
     request = SendRequest("failure", *window.target, "未成功的原句")
-    window.pending_sends[window.target] = (request, "input", "")
+    window.pending_sends[request.request_id] = (request, "input", "")
     window.input.setPlainText("下一条")
     window.day_changed()
     window.handle({"kind": "error", "operation": "send", "request": request, "message": "失败"})

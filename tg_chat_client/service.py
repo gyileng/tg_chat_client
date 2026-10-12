@@ -283,6 +283,7 @@ class TelegramService:
 
     async def sign_in(self, account_id, code="", password=""):
         from telethon.errors import SessionPasswordNeededError
+        from telethon.utils import get_display_name
 
         client = self.clients.get(account_id)
         pending = self.codes.get(account_id)
@@ -296,7 +297,9 @@ class TelegramService:
         except SessionPasswordNeededError:
             return {"account_id": account_id, "password_needed": True}
         me = await client.get_me()
-        self.store.add_account(account_id, me.first_name or pending["phone"], pending["phone"])
+        self.store.add_account(
+            account_id, get_display_name(me) or pending["phone"], pending["phone"]
+        )
         self.codes.pop(account_id, None)
         self.install_handler(account_id, client)
         self.status(account_id, "已连接")
@@ -347,17 +350,14 @@ class TelegramService:
         ]
 
     async def convert(self, aid, message):
+        from telethon.utils import get_display_name
+
         try:
             sender = await message.get_sender()
         except Exception:
             # A name lookup is optional; still show the actual message if it fails.
             sender = None
-        name = (
-            getattr(sender, "first_name", None)
-            or getattr(sender, "title", None)
-            or getattr(sender, "username", None)
-            or "未知发送者"
-        )
+        name = get_display_name(sender) or getattr(sender, "username", None) or "未知发送者"
         media = ""
         if message.photo:
             media = "photo"
@@ -440,8 +440,6 @@ class ServiceRuntime:
             if operation in {"groups", "history"}:
                 self.account_tasks[task] = account_id
             if operation == "send":
-                if target in self.busy:
-                    raise ValueError("该账号在这个群有发送请求尚未完成")
                 deadline = max(
                     self.blocked_until.get(target, 0),
                     self.blocked_accounts.get(request.account_id, 0),
@@ -450,7 +448,7 @@ class ServiceRuntime:
                     raise ValueError("Telegram 等待时间尚未结束，请稍后手动发送")
                 if not request.text.strip() or len(request.text) > 4096:
                     raise ValueError("消息须为 1–4096 个字符")
-                self.busy.add(target)
+                self.busy.add(request.request_id)
                 admitted = True
                 self.store.pending(request)
                 result = await asyncio.wait_for(self.service.send(request), 30)
@@ -541,4 +539,4 @@ class ServiceRuntime:
         finally:
             self.account_tasks.pop(task, None)
             if admitted:
-                self.busy.discard(target)
+                self.busy.discard(request.request_id)

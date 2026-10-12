@@ -64,3 +64,4 @@ class ChatMessage:
     reply_to: int | None = None
     media: str = ""
     sender_id: int | None = None
+    pending: bool = False
