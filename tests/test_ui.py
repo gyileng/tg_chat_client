@@ -1485,3 +1485,72 @@ def test_sender_color_is_stable_with_missing_identity():
     assert sender_color(None) == "#666666"
     assert sender_color(42) == sender_color(42)
     assert sender_color(42) != sender_color(43)
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_reply_bubble_shows_original_text_and_keeps_copy_to_body(window, cached):
+    from tg_chat_client.models import ChatMessage
+
+    original = ChatMessage(*window.target, 9100, "<群友>", "原文  空格\n第二行", "12:00")
+    reply = ChatMessage(
+        *window.target,
+        9101,
+        "我",
+        "回复正文",
+        "12:01",
+        True,
+        9100,
+        reply_text="" if cached else original.quote_text,
+    )
+    if cached:
+        window.put_message(original)
+    window.put_message(reply)
+    window.render_messages()
+    doc, _ = window.messages.itemDelegate().layout(reply, window.messages.font())
+    assert "引用：<群友>：原文  空格\n第二行" in doc.toPlainText()
+    assert "回复 #" not in doc.toPlainText()
+    index = window.messages.model().index_for(9101)
+    assert "原文" in index.data(Qt.ItemDataRole.AccessibleTextRole)
+    window.messages.copy_messages([index])
+    assert QApplication.clipboard().text() == "回复正文"
+
+
+def test_unavailable_reply_and_later_original_do_not_show_wrong_account_text(window):
+    from tg_chat_client.models import ChatMessage
+
+    reply = ChatMessage(*window.target, 9101, "群友", "回复", "12:00", reply_to=9100)
+    window.put_message(
+        ChatMessage("other-account", window.chat_id, 9100, "他人", "错误原文", "12:00")
+    )
+    window.put_message(reply)
+    window.render_messages()
+    delegate = window.messages.itemDelegate()
+    doc, _ = delegate.layout(reply, window.messages.font())
+    assert "原消息不可用" in doc.toPlainText()
+    assert "错误原文" not in doc.toPlainText()
+    window.put_message(ChatMessage(*window.target, 9100, "群友", "补齐原文", "12:00"))
+    window.render_messages()
+    doc, _ = delegate.layout(reply, window.messages.font())
+    assert "群友：补齐原文" in doc.toPlainText()
+
+
+def test_quote_snapshot_survives_pending_send_and_account_switch(window, qtbot):
+    from tg_chat_client.models import ChatMessage
+
+    target = window.target
+    window.put_message(ChatMessage(*target, 9100, "群友", "原文", "12:00"))
+    window.render_messages()
+    window.quote(window.messages.model().index_for(9100))
+    window.input.setPlainText("回复正文")
+    window.send_text("回复正文", "input")
+    pending = next(iter(window.pending_messages.values()))
+    doc, _ = window.messages.itemDelegate().layout(pending, window.messages.font())
+    assert "引用：群友：原文" in doc.toPlainText()
+    window.accounts.setCurrentRow(1)
+    qtbot.waitUntil(lambda: not window.pending_sends)
+    reply = next(m for m in window.buffers[target].values() if m.text == "回复正文")
+    assert reply.reply_to == 9100 and reply.reply_text == "群友：原文"
+    window.accounts.setCurrentRow(0)
+    qtbot.waitUntil(lambda: window.target == target)
+    doc, _ = window.messages.itemDelegate().layout(reply, window.messages.font())
+    assert "引用：群友：原文" in doc.toPlainText()

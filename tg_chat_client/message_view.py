@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from .message_cache import HISTORY_LIMIT
+from .models import media_text
 
 SENDER_COLORS = (
     "#a33535",
@@ -44,11 +45,6 @@ MESSAGE_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 
 def sender_color(sender_id):
     return "#666666" if sender_id is None else SENDER_COLORS[sender_id % len(SENDER_COLORS)]
-
-
-def media_text(media):
-    names = {"photo": "图片", "sticker": "贴纸", "video": "视频", "audio": "音频", "file": "文件"}
-    return "[" + names.get(media, "其他媒体") + "]" if media else ""
 
 
 class MessageModel(QAbstractListModel):
@@ -72,8 +68,15 @@ class MessageModel(QAbstractListModel):
         if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.AccessibleTextRole):
             status = " · 发送中" if message.pending else ""
             body = " ".join(text for text in (message.text, media_text(message.media)) if text)
-            return f"{message.sender}　{message.time}{status}\n{body}"
+            quote = f"\n引用：{self.reply_text(message)}" if message.reply_to else ""
+            return f"{message.sender}　{message.time}{status}{quote}\n{body}"
         return None
+
+    def reply_text(self, message):
+        if message.reply_text:
+            return message.reply_text
+        original = self.index_for(message.reply_to).data(MESSAGE_ROLE)
+        return original.quote_text if original else "原消息不可用"
 
     def index_for(self, message_id):
         row = bisect_left(self.ids, message_id)
@@ -134,20 +137,27 @@ class MessageDelegate(QStyledItemDelegate):
 
     def layout(self, message, font):
         available = max(24, int((self.view.viewport().width() - 16) * 0.75))
-        key = (message, available, font.toString())
+        quote = self.view.model().reply_text(message) if message.reply_to else ""
+        key = (message, available, font.toString(), quote)
         if key in self.layouts:
             self.layouts.move_to_end(key)
             return self.layouts[key]
         name = message.sender
         if message.outgoing and name != "我":
             name += "（我）"
-        metadata = message.time + (f" · 回复 #{message.reply_to}" if message.reply_to else "")
+        metadata = message.time
         if message.pending:
             metadata += " · 发送中…"
         content = [
             f'<p><span style="color:{sender_color(message.sender_id)}"><b>{escape(name)}</b></span>'
             f'<span style="color:#666666">　{escape(metadata)}</span></p>'
         ]
+        if quote:
+            content.append(
+                '<p><span style="color:#666666">引用：'
+                + escape(quote).replace("\n", "<br>")
+                + "</span></p>"
+            )
         body = " ".join(text for text in (message.text, media_text(message.media)) if text)
         if body:
             content.append("<p>" + escape(body).replace("\n", "<br>") + "</p>")

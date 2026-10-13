@@ -96,6 +96,7 @@ class MockService:
             True,
             request.reply_to,
             sender_id=100 + zlib.crc32(request.account_id.encode()),
+            reply_text=request.reply_text,
         )
         self.messages[request.account_id, request.chat_id].append(message)
         self.emit({"kind": "message", "message": message})
@@ -349,7 +350,7 @@ class TelegramService:
             if dialog.is_group
         ]
 
-    async def convert(self, aid, message):
+    async def convert(self, aid, message, *, resolve_reply=True):
         from telethon.utils import get_display_name
 
         try:
@@ -371,6 +372,17 @@ class TelegramService:
             media = "file"
         elif message.media:
             media = "other"
+        reply_text = ""
+        if message.reply_to_msg_id and resolve_reply:
+            try:
+                original = await asyncio.wait_for(message.get_reply_message(), 5)
+                if original:
+                    reply_text = (await self.convert(aid, original, resolve_reply=False)).quote_text
+            except Exception:
+                # A missing quote must not hide the message or fail history loading.
+                pass
+            if getattr(getattr(message, "reply_to", None), "reply_to_peer_id", None):
+                reply_text = reply_text or "原消息不可用"
         return ChatMessage(
             aid,
             message.chat_id,
@@ -382,13 +394,40 @@ class TelegramService:
             message.reply_to_msg_id,
             media,
             sender_id=getattr(message, "sender_id", None),
+            reply_text=reply_text,
         )
 
     async def history(self, account_id, chat_id, before=0):
-        messages = await self.authorized(account_id).get_messages(
-            chat_id, limit=50, offset_id=before
+        client = self.authorized(account_id)
+        messages = await client.get_messages(chat_id, limit=50, offset_id=before)
+        external = {
+            m.id
+            for m in messages
+            if getattr(getattr(m, "reply_to", None), "reply_to_peer_id", None)
+        }
+        converted = [
+            await self.convert(account_id, m, resolve_reply=m.id in external) for m in messages
+        ]
+        originals = {m.message_id: m for m in converted}
+        missing = sorted(
+            {m.reply_to for m in converted if m.reply_to and m.message_id not in external}
+            - originals.keys()
         )
-        return [await self.convert(account_id, m) for m in reversed(messages)]
+        if missing:
+            try:
+                extra = await asyncio.wait_for(client.get_messages(chat_id, ids=missing), 5)
+                for message in extra:
+                    if message:
+                        original = await self.convert(account_id, message, resolve_reply=False)
+                        originals[original.message_id] = original
+            except Exception:
+                pass
+        return [
+            replace(m, reply_text=originals[m.reply_to].quote_text)
+            if m.reply_to in originals and m.message_id not in external
+            else m
+            for m in reversed(converted)
+        ]
 
     async def send(self, request: SendRequest):
         message = await self.authorized(request.account_id).send_message(
@@ -410,6 +449,7 @@ class TelegramService:
             True,
             request.reply_to,
             sender_id=getattr(message, "sender_id", None),
+            reply_text=request.reply_text,
         )
 
 

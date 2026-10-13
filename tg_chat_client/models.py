@@ -10,6 +10,11 @@ def day_key(at: datetime | None = None) -> str:
     return (at or datetime.now(BEIJING)).astimezone(BEIJING).date().isoformat()
 
 
+def media_text(media):
+    names = {"photo": "图片", "sticker": "贴纸", "video": "视频", "audio": "音频", "file": "文件"}
+    return "[" + names.get(media, "其他媒体") + "]" if media else ""
+
+
 @dataclass(frozen=True)
 class ProxyConfig:
     protocol: Literal["socks5", "http"] = "socks5"
@@ -50,6 +55,7 @@ class SendRequest:
     chat_id: int
     text: str
     reply_to: int | None = None
+    reply_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -65,3 +71,8 @@ class ChatMessage:
     media: str = ""
     sender_id: int | None = None
     pending: bool = False
+    reply_text: str = ""
+
+    @property
+    def quote_text(self):
+        return f"{self.sender}：{self.text or media_text(self.media)}"

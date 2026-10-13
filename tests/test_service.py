@@ -90,11 +90,89 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         client = SimpleNamespace(send_message=AsyncMock(return_value=message))
         with patch.object(service, "authorized", return_value=client):
-            result = await service.send(self.request())
+            request = SendRequest("r", "a", -1, "文字", 12, "群友：引用原文")
+            result = await service.send(request)
         self.assertEqual(result.sender_id, 42)
         self.assertTrue(result.outgoing)
+        self.assertEqual(result.reply_text, "群友：引用原文")
         client.send_message.assert_awaited_once()
         message.get_sender.assert_not_awaited()
+
+    def telegram_message(self, mid, text, reply_id=None, **kwargs):
+        from telethon.tl.types import User
+
+        return SimpleNamespace(
+            id=mid,
+            chat_id=-1,
+            sender_id=42,
+            get_sender=AsyncMock(return_value=User(42, first_name="群友", last_name="全名")),
+            get_reply_message=AsyncMock(return_value=None),
+            raw_text=text,
+            date=datetime.now(timezone.utc),
+            out=False,
+            reply_to_msg_id=reply_id,
+            **{
+                **dict.fromkeys(
+                    ("photo", "sticker", "video", "gif", "voice", "audio", "document", "media")
+                ),
+                **kwargs,
+            },
+        )
+
+    async def test_history_resolves_quotes_in_page_and_batches_missing_originals(self):
+        service = TelegramService(self.store, self.events.append)
+        page = [
+            self.telegram_message(4, "回复二", 1),
+            self.telegram_message(3, "回复一", 1),
+            self.telegram_message(2, "回复本页", 3),
+        ]
+        original = self.telegram_message(1, "<原文>\n第二行")
+        client = SimpleNamespace(get_messages=AsyncMock(side_effect=[page, [original]]))
+        with patch.object(service, "authorized", return_value=client):
+            result = await service.history("a", -1)
+        self.assertEqual([m.message_id for m in result], [2, 3, 4])
+        self.assertEqual(result[0].reply_text, "群友 全名：回复一")
+        self.assertEqual(result[1].reply_text, "群友 全名：<原文>\n第二行")
+        self.assertEqual(result[2].reply_text, result[1].reply_text)
+        self.assertEqual(client.get_messages.await_count, 2)
+        client.get_messages.assert_awaited_with(-1, ids=[1])
+        for message in page:
+            message.get_reply_message.assert_not_awaited()
+
+    async def test_missing_or_failed_quote_lookup_keeps_history_and_incoming_message(self):
+        service = TelegramService(self.store, self.events.append)
+        message = self.telegram_message(2, "正文", 1)
+        for failure in ([None], OSError("unavailable"), FloodWaitError(None, capture=30)):
+            client = SimpleNamespace(get_messages=AsyncMock(side_effect=[[message], failure]))
+            with patch.object(service, "authorized", return_value=client):
+                result = await service.history("a", -1)
+            self.assertEqual(result[0].text, "正文")
+            self.assertEqual(result[0].reply_text, "")
+        message.get_reply_message.side_effect = OSError("unavailable")
+        result = await service.convert("a", message)
+        self.assertEqual(result.text, "正文")
+
+    async def test_incoming_quote_preserves_media_placeholder_without_nested_lookup(self):
+        service = TelegramService(self.store, self.events.append)
+        original = self.telegram_message(1, "", 99, photo=True)
+        message = self.telegram_message(2, "正文", 1)
+        message.get_reply_message.return_value = original
+        result = await service.convert("a", message)
+        self.assertEqual(result.reply_text, "群友 全名：[图片]")
+        original.get_reply_message.assert_not_awaited()
+
+    async def test_external_quote_never_uses_same_number_in_current_chat(self):
+        service = TelegramService(self.store, self.events.append)
+        other = self.telegram_message(1, "另一个群的原文")
+        message = self.telegram_message(2, "正文", 1, reply_to=SimpleNamespace(reply_to_peer_id=42))
+        message.get_reply_message.return_value = other
+        client = SimpleNamespace(
+            get_messages=AsyncMock(return_value=[message, self.telegram_message(1, "本群同号")])
+        )
+        with patch.object(service, "authorized", return_value=client):
+            result = await service.history("a", -1)
+        self.assertEqual(result[1].reply_text, "群友 全名：另一个群的原文")
+        client.get_messages.assert_awaited_once()
 
     async def test_sender_display_name_includes_last_name_and_preserves_fallbacks(self):
         from telethon.tl.types import ChatForbidden, User

@@ -43,7 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from .message_cache import MessageCache
-from .message_view import MESSAGE_ROLE, MessageList, media_text
+from .message_view import MESSAGE_ROLE, MessageList
 from .models import BEIJING, ChatMessage, ProxyConfig, SendRequest, day_key
 from .native_ime import cancel_windows_composition
 from .store import validate_phrase_alias
@@ -1004,7 +1004,7 @@ class MainWindow(QMainWindow):
             return
         if message:
             self.reply_id = message.message_id
-            self.reply_text = f"{message.sender}：{message.text or media_text(message.media)}"
+            self.reply_text = message.quote_text
             self.quote_label.setText("回复：" + self.reply_text[:100])
             self.save_draft()
             self.input.setFocus()
@@ -1215,7 +1215,9 @@ class MainWindow(QMainWindow):
             self.set_notice("消息须为 1–4096 个字符。")
             return
         self.save_draft()
-        request = SendRequest(uuid4().hex, self.account_id, self.chat_id, text, self.reply_id)
+        request = SendRequest(
+            uuid4().hex, self.account_id, self.chat_id, text, self.reply_id, self.reply_text
+        )
         self.bridge.submit("send", request=request)
         self.pending_sends[request.request_id] = (request, source, self.reply_text)
         self.local_message_id += 1
@@ -1229,6 +1231,7 @@ class MainWindow(QMainWindow):
             True,
             request.reply_to,
             pending=True,
+            reply_text=request.reply_text,
         )
         if source == "input":
             self.reply_id, self.reply_text = None, ""
