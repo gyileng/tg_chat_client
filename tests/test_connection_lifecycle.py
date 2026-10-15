@@ -45,9 +45,13 @@ class ConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_grace_period_reset_and_repeated_background_events(self):
         self.assertEqual(self.runtime.background_delay, 300)
-        self.runtime.set_foreground(False)
-        started = self.runtime.background_since
-        self.runtime.set_foreground(False)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        # Control only synchronous clock reads; keep the event loop's timers real.
+        with patch.object(loop, "time", return_value=started):
+            self.runtime.set_foreground(False)
+        with patch.object(loop, "time", return_value=started + 60):
+            self.runtime.set_foreground(False)
         self.assertEqual(self.runtime.background_since, started)
         await asyncio.sleep(0)
         self.assertTrue(self.service.connected)
@@ -55,8 +59,21 @@ class ConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.set_foreground(True)
         await asyncio.sleep(0)
         self.assertIsNone(self.runtime.background_since)
-        self.runtime.set_foreground(False)
-        self.assertGreater(self.runtime.background_since, started)
+        with patch.object(loop, "time", return_value=started + 120):
+            self.runtime.set_foreground(False)
+        self.assertEqual(self.runtime.background_since, started + 120)
+        self.assertTrue(self.service.connected)
+
+    async def test_foreground_round_trip_can_share_clock_tick(self):
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        with patch.object(loop, "time", return_value=now):
+            self.runtime.set_foreground(False)
+            self.runtime.set_foreground(True)
+            self.assertIsNone(self.runtime.background_since)
+            self.runtime.set_foreground(False)
+        self.assertEqual(self.runtime.background_since, now)
+        self.assertFalse(self.runtime.foreground)
         self.assertTrue(self.service.connected)
 
     async def test_disconnect_stays_offline_and_resume_retains_messages_and_login_state(self):
