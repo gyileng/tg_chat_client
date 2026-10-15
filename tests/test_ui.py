@@ -78,7 +78,8 @@ def test_application_menu_mouse_selection_exits_with_tray(tray_window, qtbot):
     assert quits == [True]
 
 
-def test_tray_close_preserves_draft_quote_and_live_service(tray_window, qtbot):
+@pytest.mark.parametrize("shortcut", [False, True])
+def test_tray_close_preserves_draft_quote_and_live_service(tray_window, qtbot, shortcut):
     window = tray_window
     target = window.target
     window.input.setPlainText("托盘草稿")
@@ -86,7 +87,11 @@ def test_tray_close_preserves_draft_quote_and_live_service(tray_window, qtbot):
     reply = window.reply_id
     bar = window.messages.verticalScrollBar()
     bar.setValue(0)
-    window.close()
+    if shortcut:
+        window.input.setFocus()
+        qtbot.keyClick(window.input, Qt.Key.Key_W, Qt.KeyboardModifier.ControlModifier)
+    else:
+        window.close()
     assert not window.isVisible()
     assert not window.closing and not window.bridge.closed
     assert not window.timer.isActive()
@@ -302,9 +307,14 @@ def test_tray_exit_cleans_up_once(tray_window, monkeypatch):
     assert quit_requests == [True]
 
 
-def test_close_without_tray_exits(window):
+@pytest.mark.parametrize("shortcut", [False, True])
+def test_close_without_tray_exits(window, qtbot, shortcut):
     assert window.tray is None
-    window.close()
+    if shortcut:
+        window.input.setFocus()
+        qtbot.keyClick(window.input, Qt.Key.Key_W, Qt.KeyboardModifier.ControlModifier)
+    else:
+        window.close()
     assert window.closing and window.bridge.closed
 
 
@@ -893,6 +903,8 @@ def test_shortcuts_do_not_fire_in_dialog(window, qtbot):
     window.input.setPlainText("保留草稿")
     qtbot.keyClick(dialog, Qt.Key.Key_2, Qt.KeyboardModifier.AltModifier)
     qtbot.keyClick(dialog, Qt.Key.Key_1, Qt.KeyboardModifier.ControlModifier)
+    qtbot.keyClick(dialog, Qt.Key.Key_W, Qt.KeyboardModifier.ControlModifier)
+    assert window.isVisible() and not window.closing
     assert window.account_id == original_account
     assert window.input.toPlainText() == "保留草稿"
     assert not window.pending_sends

@@ -551,6 +551,10 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(lambda: self.open_connection_settings())
         settings_menu.addAction(settings_action)
         application_menu = self.menuBar().addMenu("程序")
+        close_action = application_menu.addAction("关闭窗口")
+        close_action.setShortcut("Ctrl+W")
+        close_action.setAutoRepeat(False)
+        close_action.triggered.connect(self.close)
         self.exit_action = application_menu.addAction("退出")
         self.exit_action.triggered.connect(self.request_exit)
         self.notice = QLabel(
