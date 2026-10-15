@@ -461,6 +461,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.store, self.bridge, self.mock = store, bridge, mock
         self.closing = False
+        self.connection_state = "online"
+        self.connection_foreground = True
+        self.connection_visibility_timer = QTimer(self)
+        self.connection_visibility_timer.setSingleShot(True)
+        self.connection_visibility_timer.timeout.connect(self.sync_connection_visibility)
         self.tray = None
         self.hidden_dialogs = []
         self.account_id = None
@@ -685,6 +690,9 @@ class MainWindow(QMainWindow):
             self.set_notice("已取消修改连接设置。")
 
     def reconnect(self):
+        if self.connection_state != "online":
+            self.set_notice("正在恢复连接，请稍后操作。")
+            return
         if (
             self.pending_sends
             or self.account_actions
@@ -696,6 +704,9 @@ class MainWindow(QMainWindow):
         self.bridge.submit("reconnect")
 
     def open_login(self):
+        if self.connection_state != "online":
+            self.set_notice("正在恢复连接，请稍后操作。")
+            return
         if self.account_actions:
             self.set_notice("请等待账号操作完成。")
             return
@@ -887,7 +898,7 @@ class MainWindow(QMainWindow):
         self.load_groups()
 
     def load_groups(self):
-        if self.closing:
+        if self.closing or self.connection_state != "online":
             return
         if self.account_id and self.statuses.get(self.account_id) in {"已连接", "模拟连接"}:
             request_id = self.bridge.submit("groups", account_id=self.account_id)
@@ -1027,7 +1038,13 @@ class MainWindow(QMainWindow):
                 self.messages.copy_messages([item])
 
     def load_history(self, older=False):
-        if self.closing or not self.account_id or self.chat_id is None:
+        if (
+            self.closing
+            or self.connection_state != "online"
+            or not self.account_id
+            or self.chat_id is None
+            or self.statuses.get(self.account_id) not in {"已连接", "模拟连接"}
+        ):
             return
         if self.target in self.history_requests:
             return
@@ -1136,6 +1153,7 @@ class MainWindow(QMainWindow):
     def pause_view(self):
         if not self.closing:
             self.save_view()
+            self.schedule_connection_visibility()
         if hasattr(self, "timer"):
             self.timer.stop()
         self.message_resize_timer.stop()
@@ -1147,6 +1165,7 @@ class MainWindow(QMainWindow):
     def resume_view(self):
         if not self.foreground:
             return
+        self.schedule_connection_visibility()
         self.messages.setUpdatesEnabled(True)
         if self.accounts_dirty:
             self.refresh_accounts()
@@ -1166,6 +1185,18 @@ class MainWindow(QMainWindow):
         if self.target in self.cache.history:
             self.bottom.setText("有新消息 · 回到底部" if had_updates else "回到底部")
         self.refresh_counts()
+
+    def schedule_connection_visibility(self):
+        # Qt may briefly show/hide while restoring a minimized tray window.
+        # Publish only the final visibility after those synchronous events finish.
+        if not self.closing and not self.connection_visibility_timer.isActive():
+            self.connection_visibility_timer.start(0)
+
+    def sync_connection_visibility(self):
+        foreground = self.foreground
+        if not self.closing and self.connection_foreground != foreground:
+            self.connection_foreground = foreground
+            self.bridge.submit("set_foreground", foreground=foreground)
 
     def set_notice(self, text):
         self.notice_text = text
@@ -1199,6 +1230,9 @@ class MainWindow(QMainWindow):
         self.schedule_midnight()
 
     def send_text(self, text, source):
+        if self.connection_state != "online":
+            self.set_notice("正在恢复连接，请稍后手动发送；草稿已保留。")
+            return
         if self.account_actions or self.statuses.get(self.account_id) not in {"已连接", "模拟连接"}:
             self.set_notice("账号未连接或正在管理账号，请连接并登录后再发送。")
             return
@@ -1285,12 +1319,16 @@ class MainWindow(QMainWindow):
         pending_count = sum(
             (m.account_id, m.chat_id) == self.target for m in self.pending_messages.values()
         )
-        online = self.statuses.get(self.account_id) in {"已连接", "模拟连接"}
+        online = self.connection_state == "online" and self.statuses.get(self.account_id) in {
+            "已连接",
+            "模拟连接",
+        }
         self.send_button.setEnabled(valid and online and not self.account_actions and not wait)
         self.phrase_widget.setEnabled(valid)
         self.input.setEnabled(valid)
         self.older.setEnabled(
             valid
+            and online
             and self.target not in self.history_requests
             and self.target not in self.history_exhausted
         )
@@ -1315,6 +1353,46 @@ class MainWindow(QMainWindow):
         if self.closing:
             return
         kind = event["kind"]
+        if kind == "connection_state":
+            state = event["state"]
+            self.connection_state = "online" if state == "resume_failed" else state
+            if state == "pausing":
+                self.group_requests.clear()
+                self.history_requests.clear()
+                self.history_before.clear()
+                self.set_notice("后台已满 5 分钟，正在断开连接…")
+            elif state == "paused":
+                self.refresh_accounts()
+                for aid in self.account_records:
+                    if self.statuses.get(aid) != "需要登录":
+                        self.statuses[aid] = "后台已断开"
+                notice = "后台已断开，打开窗口自动重连。"
+                if self.login_dialog and (
+                    self.login_dialog.isVisible() or self.login_dialog in self.hidden_dialogs
+                ):
+                    dialog = self.login_dialog
+                    dialog.pending = None
+                    dialog.account_id = None
+                    dialog.reject()
+                    if dialog in self.hidden_dialogs:
+                        self.hidden_dialogs.remove(dialog)
+                    self.login_dialog = None
+                    notice += "未完成登录请重新发起。"
+                self.set_notice(notice)
+            elif state == "resuming":
+                self.set_notice("正在自动恢复连接…")
+            elif state == "online":
+                self.refresh_accounts()
+                self.load_groups()
+                self.load_history()
+                self.set_notice("连接恢复完成，请查看各账号状态；失败可点击“重新连接”。")
+            elif state == "resume_failed":
+                for aid in self.account_records:
+                    if self.statuses.get(aid) != "需要登录":
+                        self.statuses[aid] = "连接失败：请重新连接"
+                self.set_notice("自动恢复连接失败，请检查代理并点击“重新连接”。")
+            self.refresh_counts()
+            return
         operation = event.get("operation")
         aid = event.get("account_id")
         if operation in {"logout", "remove_account"}:
@@ -1442,7 +1520,9 @@ class MainWindow(QMainWindow):
                     for message in event["result"]:
                         self.put_message(message)
                 if target == self.target:
-                    self.render_messages(keep_scroll=bool(event.get("before")))
+                    self.render_messages(
+                        keep_scroll=bool(event.get("before")) or target in self.cache.history
+                    )
             else:
                 self.set_notice(event["message"])
         elif operation in {"start", "reconnect"}:
@@ -1543,6 +1623,7 @@ class MainWindow(QMainWindow):
         self.day_timer.stop()
         self.message_resize_timer.stop()
         self.message_sync_timer.stop()
+        self.connection_visibility_timer.stop()
         self.messages.set_pending(False)
         self.bridge.event.disconnect(self.handle)
         QApplication.instance().removeEventFilter(self.shortcut_filter)
@@ -1560,7 +1641,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(
                     self,
                     "程序仍在运行",
-                    "关闭窗口后账号继续在线。\n点击右下角托盘图标恢复窗口；"
+                    "关闭窗口后隐藏到托盘，后台满 5 分钟自动断开账号连接。\n"
+                    "打开窗口自动重连；点击右下角托盘图标恢复窗口；"
                     "右键托盘图标选择“退出”，或通过“程序 → 退出”结束程序。",
                 )
                 self.store.set_setting("tray_hint_seen", True)

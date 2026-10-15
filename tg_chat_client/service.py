@@ -9,6 +9,7 @@ from .models import ChatMessage, ProxyConfig, SendRequest
 from .store import Store
 
 logger = logging.getLogger(__name__)
+BACKGROUND_DISCONNECT_SECONDS = 5 * 60
 
 
 class MockService:
@@ -17,8 +18,10 @@ class MockService:
         self.messages = {}
         self.ids = 100
         self.ticker = None
+        self.connected = False
 
     async def start(self):
+        self.connected = True
         if not self.store.accounts() and not self.store.setting("mock_initialized", False):
             for i in range(1, 6):
                 self.store.add_account(f"mock-{i}", f"模拟账号 {i}", f"mock-{i}")
@@ -28,6 +31,8 @@ class MockService:
             aid = account["id"]
             self.emit({"kind": "status", "account_id": aid, "status": self.mock_status(aid)})
             for chat_id in (-1001, -1002):
+                if (aid, chat_id) in self.messages:
+                    continue
                 self.messages[aid, chat_id] = [
                     ChatMessage(
                         aid,
@@ -46,7 +51,8 @@ class MockService:
                 self.messages[aid, chat_id][4] = replace(
                     self.messages[aid, chat_id][4], media="photo", text="图片占位示例"
                 )
-        self.ticker = asyncio.create_task(self._tick())
+        if self.ticker is None:
+            self.ticker = asyncio.create_task(self._tick())
 
     async def _tick(self):
         while True:
@@ -68,9 +74,11 @@ class MockService:
                 self.emit({"kind": "message", "message": message})
 
     async def stop(self):
+        self.connected = False
         if self.ticker:
             self.ticker.cancel()
             await asyncio.gather(self.ticker, return_exceptions=True)
+            self.ticker = None
 
     async def groups(self, account_id):
         self.check_account(account_id)
@@ -103,17 +111,13 @@ class MockService:
         return message
 
     async def reconnect(self):
-        for account in self.store.accounts():
-            self.emit(
-                {
-                    "kind": "status",
-                    "account_id": account["id"],
-                    "status": self.mock_status(account["id"]),
-                }
-            )
+        await self.stop()
+        await self.start()
 
     def mock_status(self, aid):
-        return "需要登录" if aid in self.store.setting("mock_logged_out", []) else "模拟连接"
+        if aid in self.store.setting("mock_logged_out", []):
+            return "需要登录"
+        return "模拟连接" if self.connected else "后台已断开"
 
     def check_account(self, aid):
         if (
@@ -465,6 +469,75 @@ class ServiceRuntime:
         self.blocked_until = {}
         self.blocked_accounts = {}
         self.account_tasks = {}
+        self.control_tasks = {}
+        self.sends_idle = asyncio.Event()
+        self.sends_idle.set()
+        self.foreground = True
+        self.background_since = None
+        self.background_delay = BACKGROUND_DISCONNECT_SECONDS
+        self.connection_state = "online"
+        self.visibility_changed = asyncio.Event()
+        self.connection_task = None
+
+    def set_foreground(self, foreground):
+        if self.foreground == foreground:
+            return
+        self.foreground = foreground
+        self.background_since = None if foreground else asyncio.get_running_loop().time()
+        self.visibility_changed.set()
+        if self.connection_task is None:
+            self.connection_task = asyncio.create_task(self._manage_connection())
+
+    def connection_status(self, state):
+        self.connection_state = state
+        self.emit({"kind": "connection_state", "state": state})
+
+    async def _manage_connection(self):
+        while True:
+            self.visibility_changed.clear()
+            if self.foreground and self.connection_state == "paused":
+                self.connection_status("resuming")
+                try:
+                    async with self.control_lock:
+                        await asyncio.wait_for(self.service.start(), 60)
+                except Exception as exc:
+                    # A partial start must not leave clients outside lifecycle management.
+                    await self.service.stop()
+                    logger.warning("operation=resume error=%s", type(exc).__name__)
+                    self.connection_state = "online"
+                    self.emit({"kind": "connection_state", "state": "resume_failed"})
+                else:
+                    self.connection_status("online")
+                continue
+            if not self.foreground and self.connection_state == "online":
+                delay = (
+                    self.background_since
+                    + self.background_delay
+                    - asyncio.get_running_loop().time()
+                )
+                if delay > 0:
+                    try:
+                        await asyncio.wait_for(self.visibility_changed.wait(), delay)
+                        continue
+                    except TimeoutError:
+                        pass
+                self.connection_status("pausing")
+                # Cancel network reads and login/connect requests, but let accepted sends
+                # finish under their existing timeout. Logout/removal must finish atomically.
+                pending = list(self.account_tasks) + [
+                    task
+                    for task, operation in self.control_tasks.items()
+                    if operation not in {"logout", "remove_account"}
+                ]
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                await self.sends_idle.wait()
+                async with self.control_lock:
+                    await self.service.stop()
+                self.connection_status("paused")
+                continue
+            await self.visibility_changed.wait()
 
     async def execute(self, operation, request_id, args):
         # The service thread sets service before it starts the loop.
@@ -475,6 +548,11 @@ class ServiceRuntime:
         account_id = request.account_id if request else args.get("account_id")
         task = asyncio.current_task()
         try:
+            if operation == "set_foreground":
+                self.set_foreground(args["foreground"])
+                return
+            if self.connection_state != "online":
+                raise ValueError("后台连接已暂停或正在恢复，请等待连接完成后再操作")
             if operation in {"send", "groups", "history"} and self.control_lock.locked():
                 raise ValueError("正在修改登录或连接，请稍后操作")
             if operation in {"groups", "history"}:
@@ -489,6 +567,7 @@ class ServiceRuntime:
                 if not request.text.strip() or len(request.text) > 4096:
                     raise ValueError("消息须为 1–4096 个字符")
                 self.busy.add(request.request_id)
+                self.sends_idle.clear()
                 admitted = True
                 self.store.pending(request)
                 result = await asyncio.wait_for(self.service.send(request), 30)
@@ -502,7 +581,10 @@ class ServiceRuntime:
                 "logout",
                 "remove_account",
             }:
+                self.control_tasks[task] = operation
                 async with self.control_lock:
+                    if self.connection_state != "online":
+                        raise ValueError("后台连接已暂停或正在恢复，请等待连接完成后再操作")
                     if self.busy:
                         raise ValueError("请等待发送结束后再修改登录或连接")
                     if operation in {"logout", "remove_account"}:
@@ -578,5 +660,8 @@ class ServiceRuntime:
             raise
         finally:
             self.account_tasks.pop(task, None)
+            self.control_tasks.pop(task, None)
             if admitted:
                 self.busy.discard(request.request_id)
+                if not self.busy:
+                    self.sends_idle.set()

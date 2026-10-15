@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QMessageBox, QPushButton
 from tg_chat_client.app import report_ui_exception
 
 
-@pytest.mark.parametrize("exit_mode", ["smoke", "external"])
+@pytest.mark.parametrize("exit_mode", ["smoke", "external", "paused"])
 def test_application_exits_with_tray_and_releases_instance_lock(tmp_path, exit_mode):
     cache = tmp_path / "mock" / "cache"
     cache.mkdir(parents=True)
@@ -31,12 +31,24 @@ def setup(self):
     windows.append(self)
     if sys.argv[2] == 'external':
         QTimer.singleShot(200, QApplication.instance().quit)
+    elif sys.argv[2] == 'paused':
+        def hide():
+            self.store.set_setting('tray_hint_seen', True)
+            self.bridge.loop.call_soon_threadsafe(
+                setattr, self.bridge.runtime, 'background_delay', 0.01
+            )
+            self.close()
+            QTimer.singleShot(200, self.request_exit)
+        QTimer.singleShot(100, hide)
 MainWindow.setup_tray = setup
 args = ['--mock', '--data-dir', sys.argv[1]]
 if sys.argv[2] == 'smoke':
     args.append('--smoke-test')
 assert main(args) == 0
 assert windows[0].closing and windows[0].bridge.closed
+assert not windows[0].bridge.thread.is_alive()
+if sys.argv[2] == 'paused':
+    assert windows[0].connection_state == 'paused'
 """
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
     # A second launch using the same data directory must also succeed.

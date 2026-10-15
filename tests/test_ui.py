@@ -118,6 +118,117 @@ def test_tray_background_send_completes_without_clearing_next_draft(tray_window,
     assert any(m.text == "提交到托盘" for m in window.buffers[window.target].values())
 
 
+@pytest.mark.parametrize("minimized", [False, True])
+def test_background_disconnect_and_auto_resume_preserve_chat(tray_window, qtbot, minimized):
+    window = tray_window
+    target = window.target
+    window.input.setPlainText("离开时的草稿")
+    window.quote(window.messages.model().index(0))
+    reply_id = window.reply_id
+    window.messages.verticalScrollBar().setValue(0)
+    anchor = window.messages.anchor()
+    runtime = window.bridge.runtime
+    window.bridge.loop.call_soon_threadsafe(setattr, runtime, "background_delay", 0.03)
+    if minimized:
+        window.showMinimized()
+    else:
+        window.close()
+    qtbot.waitUntil(lambda: window.connection_state == "paused")
+    assert not window.bridge.service.connected
+    assert not window.bridge.closed
+    assert window.statuses[target[0]] == "后台已断开"
+    assert window.store.draft(*target)["text"] == "离开时的草稿"
+    sample = next(iter(window.buffers[target].values()))
+    message = replace(sample, message_id=9001, text="离线期间的新消息")
+    window.bridge.loop.call_soon_threadsafe(window.bridge.service.messages[target].append, message)
+    window.restore_window()
+    qtbot.waitUntil(lambda: window.connection_state == "online")
+    qtbot.waitUntil(lambda: not window.history_requests)
+    assert window.bridge.service.connected
+    assert window.target == target
+    assert window.input.toPlainText() == "离开时的草稿"
+    assert window.reply_id == reply_id
+    assert window.buffers[target][9001].text == "离线期间的新消息"
+    assert window.messages.anchor() == anchor
+    assert window.target in window.cache.history
+
+
+def test_minimize_then_tray_does_not_restart_background_timer(tray_window, qtbot, monkeypatch):
+    window = tray_window
+    calls = []
+    submit = window.bridge.submit
+
+    def record(operation, **args):
+        if operation == "set_foreground":
+            calls.append(args["foreground"])
+        return submit(operation, **args)
+
+    monkeypatch.setattr(window.bridge, "submit", record)
+    window.showMinimized()
+    qtbot.waitUntil(lambda: not window.bridge.runtime.foreground)
+    started = window.bridge.runtime.background_since
+    window.close()
+    assert calls == [False]
+    assert window.bridge.runtime.background_since == started
+    window.restore_window()
+    qtbot.waitUntil(lambda: window.bridge.runtime.foreground)
+    assert calls == [False, True]
+    assert window.bridge.runtime.background_since is None
+
+
+def test_background_disconnect_clears_unfinished_login_dialog(tray_window, qtbot):
+    from tg_chat_client.ui import LoginDialog
+
+    window = tray_window
+    dialog = LoginDialog(window.bridge, window)
+    dialog.pending = "unfinished"
+    dialog.account_id = "mock-1"
+    dialog.password.setText("test-only-password")
+    window.login_dialog = dialog
+    dialog.show()
+    window.bridge.loop.call_soon_threadsafe(
+        setattr, window.bridge.runtime, "background_delay", 0.03
+    )
+    window.close()
+    qtbot.waitUntil(lambda: window.connection_state == "paused")
+    assert window.login_dialog is None
+    assert dialog not in window.hidden_dialogs
+    assert not dialog.isVisible()
+    assert not dialog.password.text()
+    window.restore_window()
+    qtbot.waitUntil(lambda: window.connection_state == "online")
+    assert not dialog.isVisible()
+
+
+def test_send_failure_during_background_disconnect_restores_both_drafts(
+    tray_window, qtbot, monkeypatch
+):
+    import asyncio
+
+    window = tray_window
+
+    async def fail(request):
+        await asyncio.sleep(0.1)
+        raise OSError("test-only-network-failure")
+
+    monkeypatch.setattr(window.bridge.service, "send", fail)
+    window.bridge.loop.call_soon_threadsafe(
+        setattr, window.bridge.runtime, "background_delay", 0.03
+    )
+    window.input.setPlainText("待确认的消息")
+    window.send_text(window.input.toPlainText(), "input")
+    window.input.setPlainText("下一条草稿")
+    window.close()
+    qtbot.waitUntil(lambda: window.connection_state == "paused")
+    assert not window.pending_sends
+    assert window.store.draft(*window.target)["text"] == "待确认的消息\n下一条草稿"
+    assert window.store.count(window.account_id) == 0
+    window.restore_window()
+    qtbot.waitUntil(lambda: window.connection_state == "online")
+    assert window.input.toPlainText() == "待确认的消息\n下一条草稿"
+    assert window.store.count(window.account_id) == 0
+
+
 def test_tray_restores_owned_dialog_without_accepting_it(tray_window):
     window = tray_window
     dialog = QDialog(window)
