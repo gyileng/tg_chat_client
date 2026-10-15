@@ -749,6 +749,37 @@ def test_wait_blocks_new_sends_without_losing_other_pending_message(
     assert window.send_button.isEnabled()
 
 
+def test_query_wait_restores_draft_without_disabling_send(window, qtbot, monkeypatch):
+    calls = []
+    monkeypatch.setattr(window.bridge, "submit", lambda operation, **args: calls.append(args))
+    for text in ("第一条", "第二条"):
+        window.input.setPlainText(text)
+        qtbot.keyClick(window.input, Qt.Key.Key_Return)
+    first, second = [call["request"] for call in calls]
+    window.input.setPlainText("新草稿")
+    window.handle(
+        {
+            "kind": "error",
+            "operation": "send",
+            "request": first,
+            "message": "Telegram 获取群信息限流，需等待 15 秒，请稍后手动重试",
+            "wait": 15,
+            "wait_scope": "query",
+            "wait_kind": "query",
+            "rpc_request": "GetChannelsRequest",
+        }
+    )
+    assert window.input.toPlainText() == "第一条\n新草稿"
+    assert "获取群信息限流" in window.notice.text()
+    assert "原文本已恢复" in window.notice.text()
+    assert second.request_id in window.pending_sends
+    assert not window.blocked_accounts
+    assert not window.blocked
+    assert window.send_button.isEnabled()
+    qtbot.keyClick(window.input, Qt.Key.Key_Return)
+    assert len(calls) == 3
+
+
 def test_pending_bubbles_follow_account_and_pause_animation_in_tray(
     tray_window, qtbot, monkeypatch
 ):

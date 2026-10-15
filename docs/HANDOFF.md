@@ -1,5 +1,17 @@
 # 会话交接
 
+## 限流分类、脱敏诊断与发送群缓存（2026-10-15）
+
+用户反馈本工具提示等待 15 秒，日志仅有 `operation=send error=FloodWaitError`，同账号在官方客户端同群仍可发送。旧日志未保留具体 RPC，不能确定这次是发送还是辅助查询被限流，也不能据此认定整个账号被服务器禁止发送。
+
+ServiceRuntime 现在按错误附带的 RPC 分类：SendMessageRequest 限流仍暂停该账号发送；SlowModeWaitError 仅暂停对应群；明确的群信息、群列表和消息读取请求限流使用 `query` 范围，不设置账号或群发送等待；缺失或不认识的请求保守保留账号等待并提示原因待确认。错误事件新增 `rpc_request`、`wait_kind`，`wait_scope` 新增 `query`；界面只对 `account`/`target` 设置发送等待，查询失败仍恢复草稿且不影响其他未完成消息。不自动重发任何消息。
+
+日志增加 RPC 类名、等待秒数和本地操作请求编号，不输出异常全文、请求参数、账号、群、访问凭据或消息内容。TelegramService 从群列表保存按账号隔离的 InputPeer，发送复用缓存，缺失时解析并保存成功结果；停止连接、登录失效、重新登录与退出登录清理对应缓存。查询等待沿用 Telethon 的每账号、每 RPC 类型截止时间，没有移除服务器限流。
+
+macOS Python 3.12、Qt offscreen 下完整 **200 项测试及 2 项子测试通过**；Ruff 静态、格式与 `git diff --check` 通过。先复现新增服务回归失败，再实现修复。覆盖查询/发送/慢速/未知请求分类、日志不泄露正文和访问哈希、缓存复用与跨账号隔离及清理、查询失败后的草稿/未完成气泡保留与可继续发送。额外使用真实 Telethon MemorySession 和模拟 sender 验证：首次群信息请求收到 FloodWait，重复查询不再到达 sender，同账号缓存完整的另一群仍可发送；全程不连接 Telegram。
+
+验证命令：`rtk proxy env QT_QPA_PLATFORM=offscreen /private/tmp/tg-chat-validation/bin/python -m pytest -q`。README、开发计划及包内说明已同步。未构建或发布 Windows 包、未真实发送；下一步在新包同账号同群手动对照，若再出现等待，提供含 `rpc_request`、`wait_seconds`、`request_id` 的错误行。原 15 秒错误的具体请求仍未知，不宣称已消除真实服务器等待。
+
 ## Ctrl+W 关闭主窗口（2026-10-15）
 
 新增 `Ctrl+W` 与“程序 → 关闭窗口”，复用现有 × 关闭逻辑：有系统托盘时隐藏，无托盘时退出。关闭动作禁用长按重复，对话框中不触发主窗口关闭；完全退出仍使用“程序 → 退出”或托盘菜单。README、开发计划与包内说明已同步。

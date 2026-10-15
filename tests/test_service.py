@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from telethon.errors import FloodWaitError, PhoneMigrateError, SlowModeWaitError
+from telethon.tl import functions, types
 
 from tg_chat_client.models import ChatMessage, SendRequest
 from tg_chat_client.service import MockService, ServiceRuntime, TelegramService
@@ -88,7 +89,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             date=datetime.now(timezone.utc),
             get_sender=AsyncMock(side_effect=OSError("must not query")),
         )
-        client = SimpleNamespace(send_message=AsyncMock(return_value=message))
+        client = SimpleNamespace(
+            get_input_entity=AsyncMock(return_value=types.InputPeerChat(1)),
+            send_message=AsyncMock(return_value=message),
+        )
         with patch.object(service, "authorized", return_value=client):
             request = SendRequest("r", "a", -1, "文字", 12, "群友：引用原文")
             result = await service.send(request)
@@ -97,6 +101,62 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.reply_text, "群友：引用原文")
         client.send_message.assert_awaited_once()
         message.get_sender.assert_not_awaited()
+
+    async def test_send_peer_cache_is_per_account_and_reused(self):
+        service = TelegramService(self.store, self.events.append)
+        peers = {
+            aid: types.InputPeerChannel(123, access_hash=i) for i, aid in enumerate(("a", "b"))
+        }
+        clients = {
+            aid: SimpleNamespace(
+                get_input_entity=AsyncMock(return_value=peer),
+                send_message=AsyncMock(
+                    return_value=SimpleNamespace(id=1, date=datetime.now(timezone.utc))
+                ),
+            )
+            for aid, peer in peers.items()
+        }
+        with patch.object(service, "authorized", side_effect=clients.__getitem__):
+            for aid in ("a", "a", "b", "b"):
+                await service.send(SendRequest("r", aid, -1000000000123, "正文"))
+        for aid, client in clients.items():
+            client.get_input_entity.assert_awaited_once_with(-1000000000123)
+            self.assertEqual(client.send_message.await_count, 2)
+            self.assertIs(client.send_message.call_args.args[0], peers[aid])
+        await service.stop()
+        self.assertFalse(service.input_peers)
+
+    async def test_group_list_seeds_send_peer_cache_without_resolution(self):
+        service = TelegramService(self.store, self.events.append)
+        peer = types.InputPeerChannel(123, 456)
+
+        async def dialogs():
+            yield SimpleNamespace(id=-1000000000123, name="群", is_group=True, input_entity=peer)
+
+        client = SimpleNamespace(
+            iter_dialogs=dialogs,
+            get_input_entity=AsyncMock(side_effect=AssertionError("must use dialog peer")),
+            send_message=AsyncMock(
+                return_value=SimpleNamespace(id=1, date=datetime.now(timezone.utc))
+            ),
+        )
+        with patch.object(service, "authorized", return_value=client):
+            self.assertEqual(await service.groups("a"), [{"id": -1000000000123, "title": "群"}])
+            await service.send(SendRequest("r", "a", -1000000000123, "正文"))
+        client.get_input_entity.assert_not_awaited()
+        self.assertIs(client.send_message.call_args.args[0], peer)
+
+    async def test_peer_cache_cleared_on_invalidation_and_logout(self):
+        service = TelegramService(self.store, self.events.append)
+        self.store.add_account("a", "A", "+123")
+        service.input_peers = {"a": {-1: types.InputPeerChat(1)}, "b": {-1: types.InputPeerChat(1)}}
+        await service.invalidate("a")
+        self.assertNotIn("a", service.input_peers)
+        self.assertIn("b", service.input_peers)
+        service.input_peers["a"] = {-1: types.InputPeerChat(1)}
+        await service.logout("a")
+        self.assertNotIn("a", service.input_peers)
+        self.assertIn("b", service.input_peers)
 
     def telegram_message(self, mid, text, reply_id=None, **kwargs):
         from telethon.tl.types import User
@@ -297,6 +357,100 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.events[-1]["wait"], 30)
         self.assertEqual(len(self.service.calls), 1)
         self.assertEqual(self.store.count("a"), 0)
+        self.assertEqual(self.events[-1]["wait_kind"], "unknown")
+        self.assertIn("原因待确认", self.events[-1]["message"])
+
+    async def test_query_flood_does_not_block_new_send_and_logs_no_private_data(self):
+        self.service.error = FloodWaitError(
+            functions.channels.GetChannelsRequest([types.InputChannel(123, 987654321)]), capture=15
+        )
+        self.service.release.set()
+        with self.assertLogs("tg_chat_client.service", level="WARNING") as logs:
+            await self.send(self.request())
+        event = self.events[-1]
+        self.assertEqual(event["rpc_request"], "GetChannelsRequest")
+        self.assertEqual(event["wait_kind"], "query")
+        self.assertEqual(event["wait_scope"], "query")
+        self.assertIn("获取群信息限流", event["message"])
+        self.assertFalse(self.runtime.blocked_accounts)
+        self.assertFalse(self.runtime.blocked_until)
+        log = "\n".join(logs.output)
+        for field in ("rpc_request=GetChannelsRequest", "wait_seconds=15", "request_id=r"):
+            self.assertIn(field, log)
+        for secret in ("987654321", "InputChannel", "文字"):
+            self.assertNotIn(secret, log)
+        self.service.error = None
+        await self.send(self.request("next"))
+        self.assertEqual(len(self.service.calls), 2)
+        self.assertEqual(self.store.count("a"), 1)
+
+    async def test_telethon_query_cooldown_does_not_prevent_cached_peer_send(self):
+        from telethon import TelegramClient
+        from telethon.sessions import MemorySession
+
+        client = TelegramClient(
+            MemorySession(),
+            1,
+            "test",
+            request_retries=0,
+            raise_last_call_error=True,
+            flood_sleep_threshold=0,
+        )
+        calls = []
+
+        def respond(rpc, **kwargs):
+            calls.append(rpc)
+            future = asyncio.get_running_loop().create_future()
+            if isinstance(rpc, functions.channels.GetChannelsRequest):
+                future.set_exception(FloodWaitError(rpc, capture=15))
+            elif isinstance(rpc, functions.messages.SendMessageRequest):
+                future.set_result(types.UpdateShortSentMessage(1, 1, 1, datetime.now(timezone.utc)))
+            else:
+                self.fail(f"Unexpected request: {type(rpc).__name__}")
+            return future
+
+        client._sender = SimpleNamespace(send=respond)
+        service = TelegramService(self.store, self.events.append)
+        service.input_peers["a"] = {-1000000000999: types.InputPeerChannel(999, 456)}
+        runtime = ServiceRuntime(self.store, service, self.events.append)
+        with patch.object(service, "authorized", return_value=client):
+            for rid in ("first", "second"):
+                request = self.request(rid, chat=-1000000000123)
+                await runtime.execute("send", rid, {"request": request})
+                self.assertEqual(self.events[-1]["wait_scope"], "query")
+                self.assertGreater(self.events[-1]["wait"], 0)
+            # Telethon rejects the repeat locally; only one query reached the sender.
+            self.assertEqual(len(calls), 1)
+            cached = self.request("cached", chat=-1000000000999)
+            await runtime.execute("send", "cached", {"request": cached})
+        self.assertEqual(self.events[-1]["kind"], "result")
+        self.assertEqual(len(calls), 2)
+        self.assertIsInstance(calls[-1], functions.messages.SendMessageRequest)
+        self.assertEqual(self.store.count("a"), 1)
+
+    async def test_unrecognized_rpc_keeps_conservative_send_wait(self):
+        self.service.error = FloodWaitError(
+            functions.messages.DeleteMessagesRequest([1]), capture=15
+        )
+        self.service.release.set()
+        await self.send(self.request())
+        self.assertEqual(self.events[-1]["wait_kind"], "unknown")
+        self.assertEqual(self.events[-1]["rpc_request"], "DeleteMessagesRequest")
+        await self.send(self.request("blocked"))
+        self.assertEqual(len(self.service.calls), 1)
+
+    async def test_real_send_flood_still_blocks_account_without_logging_text(self):
+        rpc = functions.messages.SendMessageRequest(types.InputPeerChat(1), "private message")
+        self.service.error = FloodWaitError(rpc, capture=15)
+        self.service.release.set()
+        with self.assertLogs("tg_chat_client.service", level="WARNING") as logs:
+            await self.send(self.request())
+        self.assertEqual(self.events[-1]["wait_kind"], "send")
+        self.assertEqual(self.events[-1]["wait_scope"], "account")
+        self.assertIn("发送请求限流", self.events[-1]["message"])
+        self.assertNotIn("private message", "\n".join(logs.output))
+        await self.send(self.request("blocked", chat=-2))
+        self.assertEqual(len(self.service.calls), 1)
 
     async def test_connection_changes_are_rejected_while_sending(self):
         task = asyncio.create_task(self.send(self.request()))
@@ -517,6 +671,8 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.service.release.set()
         await self.send(self.request())
         self.assertEqual(self.events[-1]["wait_scope"], "target")
+        self.assertEqual(self.events[-1]["wait_kind"], "slow_mode")
+        self.assertIn("群慢速模式", self.events[-1]["message"])
         await self.send(self.request("blocked"))
         self.service.error = None
         await self.send(self.request("other", chat=-2))

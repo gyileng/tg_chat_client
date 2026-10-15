@@ -1490,7 +1490,7 @@ class MainWindow(QMainWindow):
                 if event.get("wait"):
                     if event.get("wait_scope") == "account":
                         self.blocked_accounts[request.account_id] = time.monotonic() + event["wait"]
-                    else:
+                    elif event.get("wait_scope") == "target":
                         self.blocked[target] = time.monotonic() + event["wait"]
                 self.set_notice(event["message"])
                 if pending and pending[1] == "input":

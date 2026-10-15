@@ -12,6 +12,41 @@ logger = logging.getLogger(__name__)
 BACKGROUND_DISCONNECT_SECONDS = 5 * 60
 
 
+def flood_details(exc):
+    """Classify only known RPCs; never infer an account-wide limit from a read."""
+    from telethon.errors import SlowModeWaitError
+    from telethon.tl import functions
+    from telethon.tl.tlobject import TLRequest
+
+    rpc = getattr(exc, "request", None)
+    rpc_name = type(rpc).__name__ if isinstance(rpc, TLRequest) else "unknown"
+    if isinstance(exc, SlowModeWaitError):
+        return rpc_name, "slow_mode", "target", "群慢速模式"
+    if isinstance(rpc, functions.messages.SendMessageRequest):
+        return rpc_name, "send", "account", "Telegram 发送请求限流"
+    if isinstance(
+        rpc,
+        (
+            functions.channels.GetChannelsRequest,
+            functions.messages.GetChatsRequest,
+            functions.users.GetUsersRequest,
+            functions.contacts.ResolveUsernameRequest,
+        ),
+    ):
+        return rpc_name, "query", "query", "Telegram 获取群信息限流"
+    if isinstance(
+        rpc,
+        (
+            functions.messages.GetDialogsRequest,
+            functions.messages.GetHistoryRequest,
+            functions.messages.GetMessagesRequest,
+            functions.channels.GetMessagesRequest,
+        ),
+    ):
+        return rpc_name, "query", "query", "Telegram 查询限流"
+    return rpc_name, "unknown", "account", "Telegram 要求等待（原因待确认）"
+
+
 class MockService:
     def __init__(self, store: Store, emit):
         self.store, self.emit = store, emit
@@ -148,6 +183,7 @@ class TelegramService:
         self.store, self.emit = store, emit
         self.clients = {}
         self.codes = {}
+        self.input_peers = {}
         self.monitor = None
 
     def client(self, account_id):
@@ -231,6 +267,7 @@ class TelegramService:
         )
         self.clients.clear()
         self.codes.clear()
+        self.input_peers.clear()
 
     async def reconnect(self):
         await self.stop()
@@ -245,6 +282,7 @@ class TelegramService:
     async def invalidate(self, aid):
         client = self.clients.pop(aid, None)
         self.codes.pop(aid, None)
+        self.input_peers.pop(aid, None)
         if client:
             try:
                 await client.disconnect()
@@ -260,6 +298,7 @@ class TelegramService:
             raise ValueError("手机号请使用 +国家代码号码 格式")
         account = next((a for a in self.store.accounts() if a["phone"] == phone), None)
         aid = account["id"] if account else uuid4().hex
+        self.input_peers.pop(aid, None)
         if aid in self.clients:
             await self.clients.pop(aid).disconnect()
         client = self.client(aid)
@@ -323,6 +362,7 @@ class TelegramService:
             raise ValueError("账号不存在")
         client = self.clients.pop(account_id, None)
         self.codes.pop(account_id, None)
+        self.input_peers.pop(account_id, None)
         if client is None and (self.store.root / "sessions" / (account_id + ".session")).exists():
             client = self.client(account_id)
         try:
@@ -348,11 +388,12 @@ class TelegramService:
         self.store.remove_account(account_id)
 
     async def groups(self, account_id):
-        return [
-            {"id": dialog.id, "title": dialog.name}
-            async for dialog in self.authorized(account_id).iter_dialogs()
-            if dialog.is_group
-        ]
+        result = []
+        async for dialog in self.authorized(account_id).iter_dialogs():
+            if dialog.is_group:
+                self.input_peers.setdefault(account_id, {})[dialog.id] = dialog.input_entity
+                result.append({"id": dialog.id, "title": dialog.name})
+        return result
 
     async def convert(self, aid, message, *, resolve_reply=True):
         from telethon.utils import get_display_name
@@ -434,8 +475,16 @@ class TelegramService:
         ]
 
     async def send(self, request: SendRequest):
-        message = await self.authorized(request.account_id).send_message(
-            request.chat_id,
+        client = self.authorized(request.account_id)
+        peers = self.input_peers.setdefault(request.account_id, {})
+        peer = peers.get(request.chat_id)
+        if peer is None:
+            # Telethon retains per-RPC FloodWait deadlines for unresolved queries.
+            # Do not retry a failed lookup or manufacture an access hash.
+            peer = await client.get_input_entity(request.chat_id)
+            peers[request.chat_id] = peer
+        message = await client.send_message(
+            peer,
             request.text,
             reply_to=request.reply_to,
             parse_mode=None,
@@ -605,13 +654,13 @@ class ServiceRuntime:
             )
 
             wait = exc.seconds if isinstance(exc, (FloodWaitError, SlowModeWaitError)) else 0
-            wait_scope = "account" if isinstance(exc, FloodWaitError) else "target"
+            rpc_name, wait_kind, wait_scope, wait_label = flood_details(exc)
             if wait and target:
                 if wait_scope == "account":
                     self.blocked_accounts[request.account_id] = (
                         asyncio.get_running_loop().time() + wait
                     )
-                else:
+                elif wait_scope == "target":
                     self.blocked_until[target] = asyncio.get_running_loop().time() + wait
             unknown = admitted and not isinstance(exc, (ValueError, RPCError))
             account_id = request.account_id if request else args.get("account_id")
@@ -624,7 +673,7 @@ class ServiceRuntime:
             if admitted:
                 self.store.failed(request.request_id, unknown=unknown)
             if wait:
-                message = f"Telegram 要求等待 {wait} 秒，请稍后手动重试"
+                message = f"{wait_label}，需等待 {wait} 秒，请稍后手动重试"
             elif isinstance(exc, ValueError):
                 message = str(exc)
             elif unknown:
@@ -643,8 +692,15 @@ class ServiceRuntime:
                 )
             else:
                 message = f"操作失败：{type(exc).__name__}；请检查代理、连接或登录状态"
-            # Log only the class and operation, never exception strings or arguments.
-            logger.warning("operation=%s error=%s", operation, type(exc).__name__)
+            # Class names and local IDs only: RPC repr/str may expose text or credentials.
+            logger.warning(
+                "operation=%s error=%s rpc_request=%s wait_seconds=%s request_id=%s",
+                operation,
+                type(exc).__name__,
+                rpc_name,
+                wait,
+                request_id,
+            )
             self.emit(
                 {
                     "kind": "error",
@@ -652,6 +708,8 @@ class ServiceRuntime:
                     "message": message,
                     "wait": wait,
                     "wait_scope": wait_scope,
+                    "wait_kind": wait_kind,
+                    "rpc_request": rpc_name,
                 }
             )
         except asyncio.CancelledError:
