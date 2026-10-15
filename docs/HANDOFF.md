@@ -6,7 +6,7 @@ Windows CI 返回 188 项通过、1 项失败：后台计时重置测试要求�
 
 将测试改为控制同步调用时的时钟读数，明确验证重复后台通知保留原起点、恢复窗口清除起点、再次隐藏记录新的指定起点；新增同一时钟刻度内前后台往返的用例。只在同步代码段替换时钟，不影响异步调度、超时或等待，不通过增加 sleep 掩盖问题；应用连接代码未改动。
 
-验证命令：`rtk proxy env QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q`。macOS Python 3.12 下连接生命周期 12 项及完整 **190 项测试、2 项子测试通过**；Ruff 静态、格式与 `git diff --check` 通过。待推送后 Windows CI 复核；未连接真实 Telegram。
+验证命令：`rtk proxy env QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q`。macOS Python 3.12 下连接生命周期 12 项及完整 **190 项测试、2 项子测试通过**；Ruff 静态、格式与 `git diff --check` 通过。修复提交 `2295f9a` 的 [Windows CI](https://github.com/gyileng/tg_chat_client/actions/runs/38669818888) 已全部通过，包含测试、PyInstaller 打包、便携 exe 启动退出、离线性能测量与产物上传，耗时 3 分 31 秒。可从该构建页面下载 `TGChatClient-windows-x64` 产物。真实 Telegram 账号的后台断开与恢复仍待实测。
 
 ## 后台 5 分钟自动断开与恢复重连（2026-10-15）
 
